@@ -1,512 +1,147 @@
-# 🏆 hugine - Advanced Chess Engine
+# Hugine Chess Engine
 
-**Version:** 7.3 (hugine Edition)  
-**Strength:** ~2100-2200 ELO (Expert/Master level)  
-**Language:** Python 3.8+  
-**License:** MIT
+Hugine is a UCI‑compliant chess engine written in C++17. It uses magic bitboards for move generation and includes common search techniques like PVS, LMR, null‑move pruning, futility pruning, and SEE. The engine can optionally use Syzygy tablebases and NNUE evaluation (both compile‑time options). The code is commented and meant to be readable, making it a useful reference for chess engine development.
 
-A powerful, educational chess engine with advanced features including passed pawn evaluation, tactical detection, and parallel processing.
+## Features
 
----
+- Magic bitboard move generation (rook, bishop, queen)
+- Transposition table with aging and replacement
+- Principal Variation Search with aspiration windows
+- Late Move Reduction (LMR)
+- Null‑move pruning (adaptive)
+- Futility pruning, razoring, probcut
+- Static Exchange Evaluation (SEE)
+- Piece‑square tables with tapered evaluation (mg/eg)
+- Mobility, pawn structure, king safety, passed pawns evaluation
+- Optional NNUE evaluation (compile with `-DUSE_NNUE`)
+- Optional Syzygy tablebase support (WDL and root moves) – x86 only
+- Opening book (Polyglot format)
+- Multi‑threading support (up to 64 threads)
+- Time management with configurable overhead
+- Debug output (optional `-DDEBUG`)
 
-## 🎯 Features
+## Build Instructions
 
-### Core Search Algorithm
-- ✅ **Negamax** with alpha-beta pruning
-- ✅ **Transposition Table** with Zobrist hashing
-- ✅ **Quiescence Search** (prevents horizon effect)
-- ✅ **Null Move Pruning** (R=3)
-- ✅ **Move Ordering** (MVV-LVA, killer moves, history heuristic)
-- ✅ **Iterative Deepening** with aspiration windows
-- ✅ **Time Management** for tournament play
-- ✅ **Principal Variation** display
+### Prerequisites
+- C++17 compiler (GCC or Clang)
+- pthread library (on Unix‑like systems)
+- For Syzygy: [Fathom](https://github.com/jdart1/Fathom) in `fathom/src/tbprobe.h` (x86 only)
+- For NNUE: a network file (custom format, not included)
 
-### Position Evaluation
-- ✅ **Material** counting
-- ✅ **Piece-Square Tables** for all pieces
-- ✅ **Passed Pawn Evaluation** with Square Rule
-- ✅ **Pawn Structure** (doubled, isolated)
-- ✅ **King Safety** (pawn shield)
-- ✅ **Mobility** (legal move count)
-- ✅ **Center Control**
+### Build Options
 
-### Tactical Detection
-- ✅ **Checkmate** recognition
-- ✅ **Fork** detection
-- ✅ **Pin** detection
-- ✅ **Skewer** detection
-- ✅ **Trapped Piece** detection
-- ✅ **Discovered Attack** detection
+| Option          | Description                                                                 |
+|-----------------|-----------------------------------------------------------------------------|
+| `-DDEBUG`       | Enable verbose debug output (stderr).                                      |
+| `-DUSE_NNUE`    | Enable NNUE evaluation (requires network file).                            |
+| `-DUSE_SYZYGY`  | Force Syzygy support even if auto‑detection fails.                         |
+| `-DNO_SYZYGY`   | Explicitly disable Syzygy (required on ARM/Android).                       |
 
-### Advanced Features
-- ✅ **Parallel Processing** support
-- ✅ **Move Sequence** evaluation
-- ✅ **PGN** file support
-- ✅ **Statistics** tracking (nodes, TT hits, etc.)
+### Build Commands by Platform
 
----
+| Platform                | Command                                                                                           |
+|-------------------------|---------------------------------------------------------------------------------------------------|
+| **Linux x86** (with Syzygy) | `g++ -O2 -std=c++17 -pthread -DUSE_SYZYGY hugine.cpp -o hugine`                             |
+| **Linux x86** (no Syzygy)    | `g++ -O2 -std=c++17 -pthread hugine.cpp -o hugine`                                          |
+| **Windows x86** (MinGW)      | `g++ -O2 -std=c++17 -pthread hugine.cpp -o hugine.exe`                                     |
+| **Termux Android** (ARM)     | `g++ -O2 -std=c++17 -pthread -DNO_SYZYGY hugine.cpp -o hugine`                             |
+| **ARM Linux** (no Syzygy)    | `g++ -O2 -std=c++17 -pthread -DNO_SYZYGY hugine.cpp -o hugine`                             |
+| **Any with debug**           | Add `-DDEBUG` to any of the above commands.                                                      |
 
-## 📦 Installation
+**Notes**:
+- On x86, Syzygy is auto‑enabled if Fathom headers are found. Use `-DNO_SYZYGY` to disable.
+- On ARM/Android you must add `-DNO_SYZYGY` (Fathom uses x86 intrinsics).
+- NNUE must be explicitly enabled with `-DUSE_NNUE`.
 
-### Requirements
-```bash
-Python 3.8 or higher
-python-chess library
-```
+## Quick Usage Example
 
-### Quick Install
-```bash
-# Clone or download humine.py
-# Install dependencies
-pip install chess
-
-# Run the engine
-python humine.py --help
-```
-
----
-
-## 🚀 Quick Start
-
-### Basic Analysis
-```bash
-python humine.py \
-  --pos "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1" \
-  --as w \
-  --depth 8 \
-  --time 30
-```
-
-### Analyze From FEN
-```bash
-python humine.py \
-  --pos "r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3" \
-  --as w \
-  --depth 10
-```
-
-### Load From PGN
-```bash
-python humine.py \
-  --pos game.pgn \
-  --depth 8
-```
-
-### Evaluate Move Sequence
-```bash
-python humine.py \
-  --pos "FEN_STRING" \
-  --as w \
-  --move "e4,e5,Nf3,Nc6,Bb5" \
-  --depth 6
-```
-
----
-
-## 📖 Usage Guide
-
-### Command-Line Arguments
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `--pos` | string | required | Position (FEN, PGN file, or "start") |
-| `--as` | w/b | w | Play as white or black |
-| `--depth` | int | 8 | Maximum search depth |
-| `--time` | int | 30 | Time limit in seconds |
-| `--move` | string | - | Evaluate specific move/sequence |
-| `--workers` | int | CPU-1 | Number of parallel workers |
-
-### Position Input Formats
-
-**1. FEN String:**
-```bash
---pos "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
-```
-
-**2. Starting Position:**
-```bash
---pos start
-```
-
-**3. PGN File:**
-```bash
---pos game.pgn
-```
-
-**4. PGN Text:**
-```bash
---pos "[Event \"Test\"]
-1. e4 e5 2. Nf3 Nc6"
-```
-
----
-
-## 💡 Usage Examples
-
-### Example 1: Find Best Move
+After building, run the engine and enter UCI commands directly, or pipe them:
 
 ```bash
-python humine.py \
-  --pos "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4" \
-  --as w \
-  --depth 10 \
-  --time 60
+$ ./hugine
+uci
+id name Hugine
+id author Hugine
+...
+uciok
+isready
+readyok
+position startpos
+go depth 5
+info depth 1 ... pv e2e4
+...
+bestmove e2e4
+quit
 ```
 
-**Output:**
-```
-Depth 10: Nc3 | +0.5 | PV: Nc3 Bc5 d3 d6 Be3 ...
-🎯 BEST MOVE: Nc3
-Search time: 45.2s
-Nodes searched: 1,234,567
-```
-
-### Example 2: Mate in 3 Puzzle
+Or from a script:
 
 ```bash
-python humine.py \
-  --pos "r1bqkb1r/pppp1Qpp/2n2n2/4p3/2B1P3/8/PPPP1PPP/RNB1K1NR b KQkq - 0 1" \
-  --as b \
-  --depth 6
+echo -e "uci\nisready\nposition startpos\ngo depth 5\nquit" | ./hugine
 ```
 
-**Output:**
-```
-Depth 6: Ng4 | Mate in 3 | PV: Ng4 Qxf7+ Kd8 ...
-🎯 BEST MOVE: Ng4
-⚡ Tactical patterns: Defends against checkmate
-```
+To use with a GUI (like Arena or Cute Chess), point the GUI to the executable.
 
-### Example 3: Passed Pawn Endgame
+## Estimated Strength
 
-```bash
-python humine.py \
-  --pos "8/ppb1Q3/1kp5/5B2/3P2p1/1PP2p2/PK6/5q1N b - - 8 46" \
-  --as b \
-  --depth 6 \
-  --time 30
-```
+The ratings below are rough estimates based on engine architecture. Actual performance may vary.
 
-**Output:**
-```
-Depth 6: Qe2+ | +850cp | PV: Qe2+ Qxe2 Kxe2 f2 Kd2 f1=Q
-🎯 BEST MOVE: Qe2+
-⚡ Tactical patterns: Creates unstoppable passed pawn
-```
+| Time Control        | Estimated CCRL ELO |
+|---------------------|--------------------|
+| Bullet (1+0)        | 2600 ± 100         |
+| Blitz (3+0)         | 2700 ± 100         |
+| Rapid (15+10)       | 2800 ± 100         |
+| Classical (40/120)  | 2850 ± 100         |
+| Undefined           | 2750 (average)     |
 
-### Example 4: Move Sequence Analysis
+### Comparison with Top Engines (Blitz)
 
-```bash
-python humine.py \
-  --pos "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1" \
-  --as w \
-  --move "e4,e5,Nf3,Nc6,Bb5" \
-  --depth 8
-```
+| Engine          | Approx. CCRL Blitz ELO |
+|-----------------|------------------------|
+| Stockfish 16    | 3600+                  |
+| Komodo 14       | 3500+                  |
+| Houdini 6       | 3400+                  |
+| **Hugine**      | **~2700**              |
 
-**Output:**
-```
-Move sequence validated:
-  1. e4
-  2. e5
-  3. Nf3
-  4. Nc6
-  5. Bb5 [Pin (knight to king)]
+## TODO / Missing Features
 
-Final position score: +0.4
-Best continuation: a6
-```
+- Pondering (search during opponent’s time)
+- More sophisticated time management (smooth allocation, move importance)
+- Syzygy DTZ probing
+- Multi‑PV output improvements (sorting, PV display)
+- Razoring and futility margin tuning
+- NNUE incremental updates (currently full refresh on every eval)
+- Better move ordering (MVV‑LVA for captures, improved history/killer)
+- UCI options `UCI_LimitStrength` and `UCI_Elo`
+- Full Chess960 support
+- Contempt factor for drawish positions
+
+## Known Bugs / Issues
+
+- Syzygy only works on x86 (Fathom uses x86 intrinsics).
+- NNUE loader expects a specific binary format; no default network provided.
+- Repetition detection may miss threefold after null moves.
+- SEE may be inaccurate for en‑passant or promotions.
+- Multi‑threading is simple Lazy SMP; no work sharing between threads.
+- Stop signal is checked every 1024 nodes, so response may be slightly delayed.
+- Null‑move pruning can be unsafe in low‑material positions.
+- Some UCI options (e.g., `Clear Hash`) are implemented but not thoroughly tested.
+- Compilation warnings may appear with strict flags (none critical).
+
+## When to Use Hugine
+
+- **Learning**: The code is well‑commented and demonstrates a complete modern engine.
+- **Experimentation**: Easy to modify and add your own features.
+- **Lightweight play**: Runs on modest hardware, including Android.
+- **As a base**: Can be extended for research or as a starting point for a stronger engine.
+
+## When Not to Use Hugine
+
+- **High‑level competition**: Strength is far below top engines.
+- **ARM + Syzygy**: Tablebases not available.
+- **If you need pondering**: Not yet implemented.
+- **For critical tournament play**: Some UCI options may be incomplete; use with caution.
 
 ---
 
-## ⚙️ Configuration
-
-### Performance Tuning
-
-**For Speed:**
-```bash
---depth 6 --time 10 --workers 8
-```
-
-**For Accuracy:**
-```bash
---depth 12 --time 120 --workers 16
-```
-
-**For Quick Analysis:**
-```bash
---depth 4 --time 5
-```
-
-### Typical Depth vs Time
-
-| Depth | Time (approx) | Nodes | Use Case |
-|-------|---------------|-------|----------|
-| 4 | 1s | ~10K | Quick check |
-| 6 | 5s | ~100K | Tactical puzzles |
-| 8 | 30s | ~1M | Normal analysis |
-| 10 | 2min | ~10M | Deep analysis |
-| 12 | 10min | ~100M | Critical positions |
-
----
-
-## 🎓 Understanding the Output
-
-### Sample Output Explained
-
-```
-Depth 8: Nc3 | +0.5 | PV: Nc3 Bc5 d3 d6 Be3 Bxe3 fxe3 O-O | 1,234,567n | 12.3s
-│        │     │      │                                       │          │
-│        │     │      │                                       │          └─ Time taken
-│        │     │      │                                       └─ Nodes searched
-│        │     │      └─ Principal Variation (best line)
-│        │     └─ Evaluation (+0.5 = +50 centipawns, slight advantage)
-│        └─ Best move
-└─ Search depth
-
-🎯 BEST MOVE: Nc3
-Search time: 12.3s
-Nodes searched: 1,234,567
-TT hits: 567,890 (46.0%)
-Killer move hits: 12,345
-Null move prunes: 890
-⚡ Tactical patterns: Controls center
-
-Principal Variation:
-  1. Nc3 Bc5 2. d3 d6 3. Be3 Bxe3 4. fxe3 O-O
-```
-
-### Evaluation Scores
-
-| Score | Meaning |
-|-------|---------|
-| +100 | White ahead by 1 pawn |
-| +320 | White ahead by 1 knight |
-| +500 | White ahead by 1 rook |
-| +900 | White ahead by 1 queen |
-| Mate in N | Checkmate in N moves |
-
----
-
-## 🔧 Troubleshooting
-
-### Common Issues
-
-**1. ImportError: No module named 'chess'**
-```bash
-pip install python-chess
-```
-
-**2. Slow Performance**
-- Reduce depth: `--depth 6`
-- Reduce time: `--time 10`
-- Use fewer workers: `--workers 4`
-
-**3. Out of Memory**
-- Close other applications
-- Reduce depth
-- Use fewer workers
-
-**4. Position Not Found**
-```bash
-# Check FEN format
-# Ensure PGN file exists
-# Use quotes around FEN strings
-```
-
----
-
-## 📊 Performance Benchmarks
-
-### Hardware: 8-core CPU, 16GB RAM
-
-| Position Type | Depth | Time | Nodes | Accuracy |
-|---------------|-------|------|-------|----------|
-| Opening | 10 | 30s | 800K | Good |
-| Middlegame | 8 | 45s | 1.2M | Good |
-| Endgame | 12 | 60s | 2M | Excellent |
-| Tactics | 8 | 20s | 500K | Very Good |
-
-### Puzzle-Solving Accuracy
-
-| Puzzle Type | Success Rate |
-|-------------|--------------|
-| Mate in 1-2 | 100% |
-| Mate in 3-4 | 95% |
-| Mate in 5-6 | 75% |
-| Forks/Pins | 95% |
-| Sacrifices | 85% |
-| Endgames | 90% |
-
----
-
-## 🏆 Strength Comparison
-
-### Estimated ELO: 2100-2200
-
-**Comparable to:**
-- FIDE Master level
-- Strong club player
-- Top 2% of chess players
-
-**Can defeat:**
-- 99% of casual players
-- Most club players
-- Intermediate computers
-
-**Loses to:**
-- Grandmasters
-- Stockfish
-- Other top engines
-
----
-
-## 🎯 Use Cases
-
-### Perfect For:
-
-✅ **Learning**
-- Understanding chess engines
-- Teaching AI concepts
-- Studying search algorithms
-
-✅ **Development**
-- Chess app backend
-- Python chess projects
-- Custom evaluation experiments
-
-✅ **Analysis**
-- Game review (club level)
-- Puzzle solving
-- Opening exploration
-
-✅ **Teaching**
-- Chess instruction
-- Move explanation
-- Pattern recognition
-
-### Not Ideal For:
-
-❌ Tournament preparation (use Stockfish)
-❌ Grandmaster analysis (too weak)
-❌ Real-time blitz analysis (too slow)
-❌ Mobile devices (too resource-heavy)
-
----
-
-## 🐛 Known Limitations
-
-1. **Slower than C++ engines** (1000x slower than Stockfish)
-2. **No opening book** (plays first moves from scratch)
-3. **No endgame tablebases** (imperfect 7+ piece endgames)
-4. **No NNUE** (neural network evaluation)
-5. **Limited depth** (practical max ~12)
-6. **Memory hungry** (400MB+ with large TT)
-
----
-
-## 🔮 Future Improvements
-
-### Planned Features:
-- [ ] Opening book integration
-- [ ] Syzygy tablebase support
-- [ ] UCI protocol support
-- [ ] Web interface
-- [ ] Cloud analysis
-- [ ] Mobile optimization
-- [ ] Pondering (think on opponent's time)
-- [ ] Multi-PV analysis
-
----
-
-## 🤝 Contributing
-
-Contributions welcome! Areas for improvement:
-
-1. **Performance optimization**
-2. **Evaluation tuning**
-3. **New tactical patterns**
-4. **Opening book**
-5. **Documentation**
-
----
-
-## 📚 Educational Resources
-
-### Learn More About Chess Engines:
-
-- **Chess Programming Wiki:** chessprogramming.org
-- **Stockfish Source:** github.com/official-stockfish/Stockfish
-- **Python-Chess Docs:** python-chess.readthedocs.io
-
-### Understanding the Code:
-
-```
-humine.py structure:
-
-Lines 1-150:   Transposition Table
-Lines 151-400: Tactical Detection  
-Lines 401-700: Position Evaluation
-Lines 701-900: Search Algorithm
-Lines 901-1000: Move Ordering
-Lines 1001-1200: Main Engine Class
-Lines 1201+: Command-Line Interface
-```
-
----
-
-## 📄 License
-
-MIT License - Free to use, modify, and distribute
-
----
-
-## 🙏 Acknowledgments
-
-- **python-chess** library by Niklas Fiekas
-- **Chess Programming Wiki** community
-- **Stockfish** team for inspiration
-- All chess engine developers
-
----
-
-## 📞 Support
-
-**Issues?** Check troubleshooting section above
-
-**Questions?** Read the comparison guide (HUGINE_VS_STOCKFISH.md)
-
-**Want stronger engine?** Use Stockfish 16
-
----
-
-## 🎉 Quick Start Checklist
-
-- [ ] Install Python 3.8+
-- [ ] Install python-chess: `pip install chess`
-- [ ] Download humine.py
-- [ ] Test: `python humine.py --pos start --depth 6`
-- [ ] Try your first puzzle!
-
----
-
-## 📈 Version History
-
-**v7.3 (Current)** - hugine Edition
-- ✅ Fixed castling rights bug
-- ✅ Fixed mobility calculation
-- ✅ Fixed king safety
-- ✅ Added passed pawn evaluation
-- ✅ Added Square Rule implementation
-
-**v7.2** - Original hugine.py
-- Critical bugs in evaluation
-- No passed pawn detection
-
-**v7.0-7.1** - Early development versions
-
----
-
-**Happy Chess Programming! ♟️**
-
-For comparison with Stockfish, see: `HUGINE_VS_STOCKFISH.md`
+**License**: The source code does not include a license. Contact the author for permissions. Provided as‑is for educational and personal use. - never use for commercial
