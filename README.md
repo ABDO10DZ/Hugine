@@ -1,147 +1,255 @@
-# Hugine Chess Engine
+# Hugine 2.0
 
-Hugine is a UCI‑compliant chess engine written in C++17. It uses magic bitboards for move generation and includes common search techniques like PVS, LMR, null‑move pruning, futility pruning, and SEE. The engine can optionally use Syzygy tablebases and NNUE evaluation (both compile‑time options). The code is commented and meant to be readable, making it a useful reference for chess engine development.
-
-## Features
-
-- Magic bitboard move generation (rook, bishop, queen)
-- Transposition table with aging and replacement
-- Principal Variation Search with aspiration windows
-- Late Move Reduction (LMR)
-- Null‑move pruning (adaptive)
-- Futility pruning, razoring, probcut
-- Static Exchange Evaluation (SEE)
-- Piece‑square tables with tapered evaluation (mg/eg)
-- Mobility, pawn structure, king safety, passed pawns evaluation
-- Optional NNUE evaluation (compile with `-DUSE_NNUE`)
-- Optional Syzygy tablebase support (WDL and root moves) – x86 only
-- Opening book (Polyglot format)
-- Multi‑threading support (up to 64 threads)
-- Time management with configurable overhead
-- Debug output (optional `-DDEBUG`)
-
-## Build Instructions
-
-### Prerequisites
-- C++17 compiler (GCC or Clang)
-- pthread library (on Unix‑like systems)
-- For Syzygy: [Fathom](https://github.com/jdart1/Fathom) in `fathom/src/tbprobe.h` (x86 only)
-- For NNUE: a network file (custom format, not included)
-
-### Build Options
-
-| Option          | Description                                                                 |
-|-----------------|-----------------------------------------------------------------------------|
-| `-DDEBUG`       | Enable verbose debug output (stderr).                                      |
-| `-DUSE_NNUE`    | Enable NNUE evaluation (requires network file).                            |
-| `-DUSE_SYZYGY`  | Force Syzygy support even if auto‑detection fails.                         |
-| `-DNO_SYZYGY`   | Explicitly disable Syzygy (required on ARM/Android).                       |
-
-### Build Commands by Platform
-
-| Platform                | Command                                                                                           |
-|-------------------------|---------------------------------------------------------------------------------------------------|
-| **Linux x86** (with Syzygy) | `g++ -O2 -std=c++17 -pthread -DUSE_SYZYGY hugine.cpp -o hugine`                             |
-| **Linux x86** (no Syzygy)    | `g++ -O2 -std=c++17 -pthread hugine.cpp -o hugine`                                          |
-| **Windows x86** (MinGW)      | `g++ -O2 -std=c++17 -pthread hugine.cpp -o hugine.exe`                                     |
-| **Termux Android** (ARM)     | `g++ -O2 -std=c++17 -pthread -DNO_SYZYGY hugine.cpp -o hugine`                             |
-| **ARM Linux** (no Syzygy)    | `g++ -O2 -std=c++17 -pthread -DNO_SYZYGY hugine.cpp -o hugine`                             |
-| **Any with debug**           | Add `-DDEBUG` to any of the above commands.                                                      |
-
-**Notes**:
-- On x86, Syzygy is auto‑enabled if Fathom headers are found. Use `-DNO_SYZYGY` to disable.
-- On ARM/Android you must add `-DNO_SYZYGY` (Fathom uses x86 intrinsics).
-- NNUE must be explicitly enabled with `-DUSE_NNUE`.
-
-## Quick Usage Example
-
-After building, run the engine and enter UCI commands directly, or pipe them:
-
-```bash
-$ ./hugine
-uci
-id name Hugine
-id author Hugine
-...
-uciok
-isready
-readyok
-position startpos
-go depth 5
-info depth 1 ... pv e2e4
-...
-bestmove e2e4
-quit
-```
-
-Or from a script:
-
-```bash
-echo -e "uci\nisready\nposition startpos\ngo depth 5\nquit" | ./hugine
-```
-
-To use with a GUI (like Arena or Cute Chess), point the GUI to the executable.
-
-## Estimated Strength
-
-The ratings below are rough estimates based on engine architecture. Actual performance may vary.
-
-| Time Control        | Estimated CCRL ELO |
-|---------------------|--------------------|
-| Bullet (1+0)        | 2600 ± 100         |
-| Blitz (3+0)         | 2700 ± 100         |
-| Rapid (15+10)       | 2800 ± 100         |
-| Classical (40/120)  | 2850 ± 100         |
-| Undefined           | 2750 (average)     |
-
-### Comparison with Top Engines (Blitz)
-
-| Engine          | Approx. CCRL Blitz ELO |
-|-----------------|------------------------|
-| Stockfish 16    | 3600+                  |
-| Komodo 14       | 3500+                  |
-| Houdini 6       | 3400+                  |
-| **Hugine**      | **~2700**              |
-
-## TODO / Missing Features
-
-- Pondering (search during opponent’s time)
-- More sophisticated time management (smooth allocation, move importance)
-- Syzygy DTZ probing
-- Multi‑PV output improvements (sorting, PV display)
-- Razoring and futility margin tuning
-- NNUE incremental updates (currently full refresh on every eval)
-- Better move ordering (MVV‑LVA for captures, improved history/killer)
-- UCI options `UCI_LimitStrength` and `UCI_Elo`
-- Full Chess960 support
-- Contempt factor for drawish positions
-
-## Known Bugs / Issues
-
-- Syzygy only works on x86 (Fathom uses x86 intrinsics).
-- NNUE loader expects a specific binary format; no default network provided.
-- Repetition detection may miss threefold after null moves.
-- SEE may be inaccurate for en‑passant or promotions.
-- Multi‑threading is simple Lazy SMP; no work sharing between threads.
-- Stop signal is checked every 1024 nodes, so response may be slightly delayed.
-- Null‑move pruning can be unsafe in low‑material positions.
-- Some UCI options (e.g., `Clear Hash`) are implemented but not thoroughly tested.
-- Compilation warnings may appear with strict flags (none critical).
-
-## When to Use Hugine
-
-- **Learning**: The code is well‑commented and demonstrates a complete modern engine.
-- **Experimentation**: Easy to modify and add your own features.
-- **Lightweight play**: Runs on modest hardware, including Android.
-- **As a base**: Can be extended for research or as a starting point for a stronger engine.
-
-## When Not to Use Hugine
-
-- **High‑level competition**: Strength is far below top engines.
-- **ARM + Syzygy**: Tablebases not available.
-- **If you need pondering**: Not yet implemented.
-- **For critical tournament play**: Some UCI options may be incomplete; use with caution.
+> A UCI chess engine written in C++17 with parallel search, Syzygy endgame tablebases, optional NNUE evaluation, Chess960 support, and an on-disk learning system.
 
 ---
 
-**License**: The source code does not include a license. Contact the author for permissions. Provided as‑is for educational and personal use. - never use for commercial
+## Features
+
+### Move Generation
+- Bitboard-based pseudo-legal move generator (magic bitboards for sliding pieces)
+- Fully correct castling: standard and Chess960 (king-to-rook UCI protocol)
+- En passant, promotions, and all special moves
+- SEE (Static Exchange Evaluation) for move ordering and pruning
+
+### Search
+- Iterative deepening with aspiration windows (±15 cp, widening by 50)
+- Principal Variation Search (PVS / negamax with α-β)
+- Quiescence search (depth cap 8, full evasions when in check)
+- **Parallel search**: YBWC (Young Brothers Wait Concept) split points, up to 64 threads
+
+| Technique | Details |
+|---|---|
+| Null move pruning | R = 2 + depth/6 |
+| Late Move Reductions (LMR) | base 1, divisor 2 |
+| Late Move Pruning (LMP) | base 3, factor 2 |
+| Futility pruning | 200 cp × depth |
+| Razoring | depth ≤ 6, margins 300/400/600 |
+| Static null move | depth > 7, margin 200 |
+| Singular extensions | depth ≥ 8, margin 50 |
+| ProbCut | depth ≥ 5 |
+| IID (Internal Iterative Deepening) | depth ≥ 5, reduction 2 |
+| Multi-cut | depth ≥ 6, 2 of top 3 fail-high |
+| Check extensions | always |
+| Recapture extensions | previous ply captured on same square |
+| Passed pawn extensions | advancing past the midpoint |
+
+### Move Ordering
+- TT move first
+- Killer moves (2 per ply)
+- Counter moves
+- Follow-up moves
+- History heuristic (gravity-scaled, max ±16384)
+- Butterfly history
+- Capture history (indexed by moving piece × captured piece × target)
+- Continuation history (2-ply)
+- Correction history
+
+### Evaluation
+- Piece-square tables (tapered by game phase)
+- Pawn structure: passed pawns, isolated pawns
+- Mobility bonuses per piece type
+- Outpost detection for knights and bishops
+- King safety (shelter pawns, pawn storm, open files)
+- Space control
+- Material imbalance
+- Bishop pair bonus
+- Rook on open/semi-open files
+- Endgame king activity
+
+**Optional NNUE** (compile with `-DUSE_NNUE`): HalfKP architecture, 256-neuron feature transformer, incremental updates, int8 weights, SIMD-ready.
+
+### Endgame Tablebases
+- Syzygy DTZ/WDL via [Fathom](https://github.com/jdart1/Fathom) (auto-detected at compile time)
+- Root DTZ probing for optimal endgame play
+- Interior WDL probing at depth ≤ 3
+- Falls back to evaluation if tablebases not present — no stub required
+
+### Opening Book
+- Polyglot `.bin` format
+- Configurable variety (0 = best move, 10 = max randomness)
+
+### Learning System
+- In-memory hash table (1M entries) updated from game results
+- Adjustments applied at every node during search
+- Persistent save/load via `LearningFile`
+
+### Time Management
+- Soft/hard limits with configurable move overhead
+- Adaptive scaling based on score stability and best-move changes
+- Full support for `wtime`/`btime`/`winc`/`binc`/`movestogo`/`movetime`/`infinite`/`ponder`
+
+---
+
+## Building
+
+### Requirements
+- C++17 compiler (GCC 9+, Clang 10+)
+- POSIX threads (`-pthread`)
+
+### Basic Build
+```bash
+g++ -O2 -std=c++17 -pthread -march=native hugine.cpp -o hugine
+```
+
+### With Syzygy Tablebases
+Clone Fathom into a `fathom/` subdirectory alongside `hugine.cpp`:
+```bash
+git clone https://github.com/jdart1/Fathom fathom
+g++ -O2 -std=c++17 -pthread -march=native hugine.cpp fathom/src/tbprobe.cpp -o hugine
+```
+Hugine detects the header automatically at compile time — no extra flags needed.
+
+### With NNUE
+```bash
+g++ -O2 -std=c++17 -pthread -march=native -DUSE_NNUE hugine.cpp -o hugine
+```
+Place your network file and point to it with `setoption name EvalFile value <path>`.
+
+### Build Flags Summary
+
+| Flag | Effect |
+|---|---|
+| `-march=native` | Enables hardware-specific SIMD (recommended) |
+| `-DUSE_NNUE` | Enables NNUE evaluation layer |
+| `-DNO_SYZYGY` | Force-disables Syzygy even if Fathom is present |
+| `-DDEBUG` | Enables extra diagnostics (hash clearing messages, etc.) |
+
+---
+
+## Installation
+
+Hugine is a command-line UCI engine. Use it with any UCI-compatible GUI:
+
+| GUI | Platform | Notes |
+|---|---|---|
+| [Cute Chess](https://cutechess.com) | Linux / macOS / Windows | Great for engine matches |
+| [Arena](http://www.playwitharena.de) | Windows | Feature-rich free GUI |
+| [Scid vs. PC](https://scidvspc.sourceforge.net) | Linux / macOS / Windows | Database + engine |
+| [En Croissant](https://encroissant.org) | Linux / macOS / Windows | Modern, open source |
+| [BanksiaGUI](https://banksiagui.com) | Linux / macOS / Windows | Multi-engine testing |
+| [ChessBase](https://www.chessbase.com) | Windows | Commercial |
+
+**Add to your GUI**: point it to the `hugine` binary and select UCI protocol.
+
+---
+
+## UCI Options
+
+| Option | Type | Default | Range | Description |
+|---|---|---|---|---|
+| `Hash` | spin | 256 | 1–8192 | Transposition table size in MB |
+| `Threads` | spin | 1 | 1–64 | Number of search threads (YBWC) |
+| `Ponder` | check | false | — | Allow thinking on opponent's time |
+| `MultiPV` | spin | 1 | 1–5 | Number of lines to report |
+| `Contempt` | spin | 0 | -100–100 | Contempt factor in centipawns |
+| `Move Overhead` | spin | 100 | 0–5000 | Safety buffer (ms) subtracted from time |
+| `OwnBook` | check | true | — | Use built-in opening book |
+| `BookFile` | string | — | — | Path to Polyglot `.bin` opening book |
+| `BookVariety` | spin | 0 | 0–10 | Book move randomness |
+| `SyzygyPath` | string | — | — | Directory containing Syzygy `.rtbw`/`.rtbz` files |
+| `EvalFile` | string | — | — | NNUE network file path (requires `-DUSE_NNUE`) |
+| `UCI_Chess960` | check | false | — | Enable Chess960 (FRC) mode |
+| `UCI_LimitStrength` | check | false | — | Enable Elo-limited play |
+| `UCI_Elo` | spin | 1500 | 800–3000 | Target Elo (when LimitStrength is on) |
+| `Learning` | check | false | — | Enable position learning |
+| `LearningFile` | string | — | — | File for persistent learning data |
+| `LearningRate` | spin | 100 | 1–1000 | Learning adjustment speed |
+| `LearningMaxAdjust` | spin | 50 | 0–200 | Maximum centipawn adjustment per position |
+| `Clear Learning` | button | — | — | Wipe in-memory learning table |
+| `Save Learning` | button | — | — | Write learning table to `LearningFile` |
+| `Clear Hash` | button | — | — | Reset transposition table |
+| `TuningMode` | check | false | — | Log positions + scores for tuning |
+| `TuningFile` | string | — | — | Output file for tuning data |
+
+---
+
+## Custom Commands
+
+Beyond the standard UCI protocol, Hugine supports these extra commands at the prompt:
+
+### `d` — Display position
+Prints the board, FEN, side to move, en passant square, 50-move counter, and full castling rights diagnostic (which rook, where the king and rook land).
+
+```
+position fen r3k2r/pppppppp/8/8/8/8/PPPPPPPP/R3K2R w KQkq - 0 1
+d
+```
+
+### `perft <depth>` — Performance test
+Counts leaf nodes at the given depth and reports a move-by-move breakdown (divide), total nodes, time, and NPS.
+
+```
+position startpos
+perft 5
+```
+
+Expected output for the start position:
+```
+a2a3: 181046
+...
+Nodes searched: 4865609  depth: 5  time: 430ms  nps: 11,300,000
+```
+
+### `eval` — Static evaluation
+Prints the evaluation of the current position in centipawns from the side to move's perspective.
+
+### `learn result <win|draw|loss>` — Record result
+Updates the learning table with the game outcome for all positions in the last search's PV. Enable with `setoption name Learning value true` first.
+
+```
+learn result win
+```
+
+---
+
+## Chess960 (Fischer Random Chess)
+
+Enable with `setoption name UCI_Chess960 value true` **before** setting the position.
+
+Move input and output follow the UCI Chess960 convention: castling is sent as **king-to-rook** (e.g. `e1h1` for White kingside) rather than king-to-destination (`e1g1`).
+
+```
+setoption name UCI_Chess960 value true
+position fen r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/2N2N2/PPPP1PPP/R1BQK2R w KQkq - 4 4
+go depth 10
+```
+
+---
+
+## Verification
+
+Run the built-in perft suite to confirm correct move generation:
+
+```bash
+printf "position startpos\nperft 5\nquit\n" | ./hugine
+# Expected: 4865609
+
+printf "position fen r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1\nperft 4\nquit\n" | ./hugine
+# Expected: 4085603
+
+printf "position fen 8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1\nperft 6\nquit\n" | ./hugine
+# Expected: 11030083
+```
+
+---
+
+## Project Structure
+
+```
+hugine.cpp          — Full engine source (single file, ~4200 lines)
+fathom/             — Syzygy tablebase probing library (optional, git submodule)
+README.md           — This file
+```
+
+The source is divided into four self-contained parts:
+1. **Core Foundation** — types, bitboards, Zobrist hashing, FEN parsing, make/undo move, move generation
+2. **Evaluation** — HCE evaluation, optional NNUE, Syzygy probing, opening book, learning, time management
+3. **Search** — negamax, quiescence, YBWC parallel search, move ordering, all pruning techniques
+4. **UCI Interface** — command parser, `d`/`perft`/`eval`/`learn`, `go`/`stop`/`ponderhit`
+
+---
+
+## Author
+
+**0xbytecode**
