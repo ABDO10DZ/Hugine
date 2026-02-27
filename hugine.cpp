@@ -1,10 +1,9 @@
 /*
- * hugine_final.cpp  –  Fully corrected version with optional DEBUG instrumentation
- *
- * Compile normally:          g++ -O2 -std=c++17 -pthread hugine_final.cpp -o hugine
- * Compile with debug output: g++ -O2 -std=c++17 -pthread -DDEBUG hugine_final.cpp -o hugine
- *
- * Debug output goes to stderr, does not interfere with UCI.
+ * Hugine 2.0 – UCI chess engine
+ * Author: 0xbytecode
+ * Features: all 24 advanced features, full Syzygy DTZ, learning, NNUE, YBWC, Chess960, etc.
+ * Compile: g++ -O2 -std=c++17 -pthread -march=native hugine.cpp -o hugine
+ * Options: -DUSE_NNUE, -DDEBUG, -DNO_SYZYGY
  */
 
 #include <iostream>
@@ -29,49 +28,52 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdio>
+#include <cassert>
+#include <functional>
 
-// ============================================================================
-// PLATFORM / ARCHITECTURE DETECTION
-// ============================================================================
+// Platform detection
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
     #define ARCH_X86 1
 #else
     #define ARCH_X86 0
 #endif
-
 #if defined(__aarch64__) || defined(_M_ARM64) || defined(__arm__) || defined(_M_ARM)
     #define ARCH_ARM 1
 #else
     #define ARCH_ARM 0
 #endif
-
 #if defined(__linux__)
     #define OS_LINUX 1
 #else
     #define OS_LINUX 0
 #endif
-
 #if defined(__ANDROID__)
     #define OS_ANDROID 1
 #else
     #define OS_ANDROID 0
 #endif
-
 #if defined(__APPLE__)
     #define OS_APPLE 1
 #else
     #define OS_APPLE 0
 #endif
-
 #if defined(_WIN32) || defined(_WIN64)
     #define OS_WINDOWS 1
 #else
     #define OS_WINDOWS 0
 #endif
 
-// ============================================================================
-// SYZYGY (Fathom) availability – auto‑enabled only on x86 with fathom/ present
-// ============================================================================
+// SIMD detection
+#if defined(__AVX2__)
+    #define USE_AVX2 1
+#elif defined(__SSE4_1__)
+    #define USE_SSE41 1
+#elif defined(__ARM_NEON)
+    #define USE_NEON 1
+#endif
+
+// Syzygy availability
 #if defined(USE_SYZYGY)
     #define HAS_SYZYGY 1
 #elif defined(NO_SYZYGY)
@@ -86,72 +88,65 @@
     #define HAS_SYZYGY 0
 #endif
 
-// ============================================================================
-// Fathom include or stubs
-// ============================================================================
 #if HAS_SYZYGY
-  #if ARCH_ARM || OS_ANDROID
-    #error "Fathom/Syzygy cannot be compiled on ARM/Android (uses x86 intrinsics). Add -DNO_SYZYGY."
-  #endif
 extern "C" {
 #include "fathom/src/tbprobe.h"
 }
 #else
-// Stubs so the rest of the code compiles unchanged
-#define TB_RESULT_FAILED  0xFFFFFFFF
-#define TB_WIN            2
-#define TB_LOSS           0
-#define TB_DRAW           1
-#define TB_CURSED_WIN     3
-#define TB_BLESSED_LOSS   (-1)
-#define TB_PAWN           1
-#define TB_KNIGHT         2
-#define TB_BISHOP         3
-#define TB_ROOK           4
-#define TB_QUEEN          5
-#define TB_KING           6
-#define TB_SIDEMASK       0x40
-#define TB_MAX_MOVES      256
-inline bool     tb_init(const char*)                                                               { return false; }
-inline void     tb_free()                                                                          {}
-inline int      tb_max_cardinality()                                                               { return 0; }
-inline unsigned tb_probe_wdl(unsigned*,unsigned*,int,int,int,int,int,int,int,int)                 { return TB_RESULT_FAILED; }
-inline unsigned* tb_probe_root(unsigned*,unsigned*,int,int,int,int,int,int,int,int,void*)         { return nullptr; }
-#endif // HAS_SYZYGY
+#define TB_RESULT_FAILED 0xFFFFFFFF
+#define TB_WIN 2
+#define TB_LOSS 0
+#define TB_DRAW 1
+#define TB_CURSED_WIN 3
+#define TB_BLESSED_LOSS (-1)
+#define TB_PAWN 1
+#define TB_KNIGHT 2
+#define TB_BISHOP 3
+#define TB_ROOK 4
+#define TB_QUEEN 5
+#define TB_KING 6
+#define TB_SIDEMASK 0x40
+#define TB_MAX_MOVES 256
+inline bool tb_init(const char*) { return false; }
+inline void tb_free() {}
+inline int tb_max_cardinality() { return 0; }
+inline unsigned tb_probe_wdl(unsigned*,unsigned*,int,int,int,int,int,int,int,int) { return TB_RESULT_FAILED; }
+inline unsigned tb_probe_root_dtz(unsigned*,unsigned*,int,int,int,int,int,int,int,int,int*) { return TB_RESULT_FAILED; }
+inline unsigned* tb_probe_root(unsigned*,unsigned*,int,int,int,int,int,int,int,int,void*) { return nullptr; }
+#endif
 
-// ============================================================================
-// NNUE availability (must be explicitly enabled with -DUSE_NNUE)
-// ============================================================================
-// (USE_NNUE is handled inline with #ifdef later)
-
+// Type aliases
 using U64 = uint64_t;
 using Move = uint32_t;
 using Square = int;
 using Value = int;
 using Depth = int;
 
+// Enums
 enum Color { WHITE, BLACK };
 enum PieceType { NO_PIECE, PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING };
 enum Bound { BOUND_NONE, BOUND_UPPER, BOUND_LOWER, BOUND_EXACT };
 
+// Constants
 constexpr Square NO_SQUARE = -1;
-
-// --- FIX: NULL_MOVE sentinel (outside 12-bit move encoding) ---
 constexpr Move NO_MOVE = 0;
-constexpr Move NULL_MOVE = 0xFFFFFFFFu;          // sentinel, cannot be a legal move
-
+constexpr Move NULL_MOVE = 0xFFFFFFFFu;
 constexpr int MAX_PLY = 128;
+// Maximum quiescence depth (in plies from the quiescence entry point).
+// Without a cap, tactical positions with many captures cause exponential node
+// explosion that hangs the engine at depth 2-3.  16 levels is plenty to
+// resolve all capture chains while keeping the search tractable.
+constexpr int MAX_QSEARCH_DEPTH = 8;
 constexpr int MAX_MOVES = 256;
 constexpr Value MATE_SCORE = 32000;
 constexpr Value INF = 32001;
-constexpr int MATE_OFFSET = 20000;               // offset for TT mate storage
+constexpr int MATE_OFFSET = 20000;
 constexpr int ASPIRATION_WINDOW = 15;
 constexpr int ASPIRATION_WIDEN = 50;
 constexpr int RAZOR_MARGIN_D1 = 300;
 constexpr int RAZOR_MARGIN_D2 = 400;
 constexpr int RAZOR_MARGIN_D3 = 600;
 constexpr int FUTILITY_MARGIN_FACTOR = 200;
-constexpr int FUTILITY_MARGINS[8] = {0, 100, 250, 400, 550, 700, 850, 1000};
 constexpr int LMR_BASE = 1;
 constexpr int LMR_DIV = 2;
 constexpr int NULL_MOVE_R = 2;
@@ -162,10 +157,11 @@ constexpr int SINGULAR_EXTENSION_DEPTH = 8;
 constexpr int SINGULAR_MARGIN = 50;
 constexpr int MAX_THREADS = 64;
 constexpr int MAX_HISTORY = 16384;
-constexpr int HISTORY_BONUS = 32;
-constexpr int HISTORY_MALUS = 32;
 constexpr int PROBCUT_DEPTH = 5;
-constexpr int PROBCUT_MARGIN = 100;
+constexpr int PROBCUT_MARGIN_BASE = 100;
+constexpr int PROBCUT_MARGIN_PER_DEPTH = 20;
+constexpr int LMP_BASE = 3;
+constexpr int LMP_FACTOR = 2;
 
 constexpr int PIECE_VALUES[7] = {0, 100, 320, 330, 500, 900, 0};
 constexpr int PHASE_KNIGHT = 1;
@@ -174,6 +170,10 @@ constexpr int PHASE_ROOK = 2;
 constexpr int PHASE_QUEEN = 4;
 constexpr int TOTAL_PHASE = 24;
 
+constexpr size_t LEARNING_TABLE_SIZE = 1 << 20; // 1,048,576 entries
+constexpr int LEARNING_MAX_ADJUST = 50;
+
+// Basic move utilities
 inline Square make_square(int f, int r) { return r * 8 + f; }
 inline int file_of(Square s) { return s & 7; }
 inline int rank_of(Square s) { return s >> 3; }
@@ -209,12 +209,10 @@ inline bool is_castling(Move m) { return (m & PROMO_MASK) == CASTLE_FLAG; }
 inline bool is_en_passant(Move m) { return (m & PROMO_MASK) == ENPASSANT_FLAG; }
 
 inline int popcount(U64 b) { return __builtin_popcountll(b); }
-inline Square lsb(U64 b) { return b ? Square(__builtin_ctzll(b)) : 0; }
+inline Square lsb(U64 b) { assert(b != 0 && "lsb called on empty bitboard"); return Square(__builtin_ctzll(b)); }
 inline Square pop_lsb(U64& b) { Square s = lsb(b); b &= b - 1; return s; }
 
-// ============================================================================
-// Magic bitboard declarations
-// ============================================================================
+// Magic bitboards
 struct Magic {
     U64 mask;
     U64 magic;
@@ -226,8 +224,10 @@ extern Magic rook_magics[64];
 extern Magic bishop_magics[64];
 extern U64 rook_attacks_table[102400];
 extern U64 bishop_attacks_table[102400];
-extern U64 rook_attacks_magic(Square s, U64 occ);
-extern U64 bishop_attacks_magic(Square s, U64 occ);
+// Classical attack functions defined below (no longer using magic lookup tables)
+U64 rook_attacks_magic(Square s, U64 occ);
+U64 bishop_attacks_magic(Square s, U64 occ);
+U64 queen_attacks_magic(Square s, U64 occ);
 extern void init_magics();
 
 namespace Bitboards {
@@ -272,7 +272,6 @@ U64 bishop_attacks_table[102400];
 Magic rook_magics[64];
 Magic bishop_magics[64];
 
-// --- FIX: Freshly generated collision‑free magic numbers ---
 const U64 rook_magic_numbers[64] = {
     0x0480002181104000ULL, 0x004000A006500140ULL, 0x048020000A801001ULL, 0x00800C8110000800ULL,
     0x9280221400480080ULL, 0x02000C1013582200ULL, 0x2200040082000801ULL, 0x2600014033810204ULL,
@@ -312,44 +311,36 @@ const U64 bishop_magic_numbers[64] = {
 };
 
 const int rook_shifts[64] = {
-    52, 53, 53, 53, 53, 53, 53, 52,
-    53, 54, 54, 54, 54, 54, 54, 53,
-    53, 54, 54, 54, 54, 54, 54, 53,
-    53, 54, 54, 54, 54, 54, 54, 53,
-    53, 54, 54, 54, 54, 54, 54, 53,
-    53, 54, 54, 54, 54, 54, 54, 53,
-    53, 54, 54, 54, 54, 54, 54, 53,
-    52, 53, 53, 53, 53, 53, 53, 52
+    52,53,53,53,53,53,53,52,53,54,54,54,54,54,54,53,
+    53,54,54,54,54,54,54,53,53,54,54,54,54,54,54,53,
+    53,54,54,54,54,54,54,53,53,54,54,54,54,54,54,53,
+    53,54,54,54,54,54,54,53,52,53,53,53,53,53,53,52
 };
 
 const int bishop_shifts[64] = {
-    58, 59, 59, 59, 59, 59, 59, 58,
-    59, 59, 59, 59, 59, 59, 59, 59,
-    59, 59, 57, 57, 57, 57, 59, 59,
-    59, 59, 57, 55, 55, 57, 59, 59,
-    59, 59, 57, 55, 55, 57, 59, 59,
-    59, 59, 57, 57, 57, 57, 59, 59,
-    59, 59, 59, 59, 59, 59, 59, 59,
-    58, 59, 59, 59, 59, 59, 59, 58
+    58,59,59,59,59,59,59,58,59,59,59,59,59,59,59,59,
+    59,59,57,57,57,57,59,59,59,59,57,55,55,57,59,59,
+    59,59,57,55,55,57,59,59,59,59,57,57,57,57,59,59,
+    59,59,59,59,59,59,59,59,58,59,59,59,59,59,59,58
 };
 
 U64 rook_mask(Square s) {
     U64 mask = 0;
     int f = file_of(s), r = rank_of(s);
-    for (int rr = r + 1; rr < 7; ++rr) mask |= 1ULL << make_square(f, rr);
-    for (int rr = r - 1; rr > 0; --rr) mask |= 1ULL << make_square(f, rr);
-    for (int ff = f + 1; ff < 7; ++ff) mask |= 1ULL << make_square(ff, r);
-    for (int ff = f - 1; ff > 0; --ff) mask |= 1ULL << make_square(ff, r);
+    for (int rr = r+1; rr < 7; ++rr) mask |= 1ULL << make_square(f, rr);
+    for (int rr = r-1; rr > 0; --rr) mask |= 1ULL << make_square(f, rr);
+    for (int ff = f+1; ff < 7; ++ff) mask |= 1ULL << make_square(ff, r);
+    for (int ff = f-1; ff > 0; --ff) mask |= 1ULL << make_square(ff, r);
     return mask;
 }
 
 U64 bishop_mask(Square s) {
     U64 mask = 0;
     int f = file_of(s), r = rank_of(s);
-    for (int i = 1; f + i < 7 && r + i < 7; ++i) mask |= 1ULL << make_square(f + i, r + i);
-    for (int i = 1; f - i > 0 && r + i < 7; ++i) mask |= 1ULL << make_square(f - i, r + i);
-    for (int i = 1; f + i < 7 && r - i > 0; ++i) mask |= 1ULL << make_square(f + i, r - i);
-    for (int i = 1; f - i > 0 && r - i > 0; ++i) mask |= 1ULL << make_square(f - i, r - i);
+    for (int i = 1; f+i < 7 && r+i < 7; ++i) mask |= 1ULL << make_square(f+i, r+i);
+    for (int i = 1; f-i > 0 && r+i < 7; ++i) mask |= 1ULL << make_square(f-i, r+i);
+    for (int i = 1; f+i < 7 && r-i > 0; ++i) mask |= 1ULL << make_square(f+i, r-i);
+    for (int i = 1; f-i > 0 && r-i > 0; ++i) mask |= 1ULL << make_square(f-i, r-i);
     return mask;
 }
 
@@ -358,12 +349,10 @@ void init_magics() {
     U64* bishop_ptr = bishop_attacks_table;
 
     for (int sq = 0; sq < 64; ++sq) {
-        // Rooks
         U64 mask = rook_mask(sq);
         int shift = rook_shifts[sq];
         U64 magic = rook_magic_numbers[sq];
         int num_occ = 1 << (64 - shift);
-
         rook_magics[sq].mask = mask;
         rook_magics[sq].magic = magic;
         rook_magics[sq].shift = shift;
@@ -380,42 +369,35 @@ void init_magics() {
             }
             U64 attacks = 0;
             int f = file_of(sq), r = rank_of(sq);
-            // up
-            for (int rr = r + 1; rr < 8; ++rr) {
+            for (int rr = r+1; rr < 8; ++rr) {
                 Square s2 = make_square(f, rr);
                 attacks |= 1ULL << s2;
                 if (occ & (1ULL << s2)) break;
             }
-            // down
-            for (int rr = r - 1; rr >= 0; --rr) {
+            for (int rr = r-1; rr >= 0; --rr) {
                 Square s2 = make_square(f, rr);
                 attacks |= 1ULL << s2;
                 if (occ & (1ULL << s2)) break;
             }
-            // right
-            for (int ff = f + 1; ff < 8; ++ff) {
+            for (int ff = f+1; ff < 8; ++ff) {
                 Square s2 = make_square(ff, r);
                 attacks |= 1ULL << s2;
                 if (occ & (1ULL << s2)) break;
             }
-            // left
-            for (int ff = f - 1; ff >= 0; --ff) {
+            for (int ff = f-1; ff >= 0; --ff) {
                 Square s2 = make_square(ff, r);
                 attacks |= 1ULL << s2;
                 if (occ & (1ULL << s2)) break;
             }
-            // Store at magic‑hashed index (FIX)
             U64 idx = (occ * magic) >> shift;
             rook_ptr[idx] = attacks;
         }
         rook_ptr += num_occ;
 
-        // Bishops
         mask = bishop_mask(sq);
         shift = bishop_shifts[sq];
         magic = bishop_magic_numbers[sq];
         num_occ = 1 << (64 - shift);
-
         bishop_magics[sq].mask = mask;
         bishop_magics[sq].magic = magic;
         bishop_magics[sq].shift = shift;
@@ -432,27 +414,23 @@ void init_magics() {
             }
             U64 attacks = 0;
             int f = file_of(sq), r = rank_of(sq);
-            // NE
-            for (int i = 1; f + i < 8 && r + i < 8; ++i) {
-                Square s2 = make_square(f + i, r + i);
+            for (int i = 1; f+i < 8 && r+i < 8; ++i) {
+                Square s2 = make_square(f+i, r+i);
                 attacks |= 1ULL << s2;
                 if (occ & (1ULL << s2)) break;
             }
-            // NW
-            for (int i = 1; f - i >= 0 && r + i < 8; ++i) {
-                Square s2 = make_square(f - i, r + i);
+            for (int i = 1; f-i >= 0 && r+i < 8; ++i) {
+                Square s2 = make_square(f-i, r+i);
                 attacks |= 1ULL << s2;
                 if (occ & (1ULL << s2)) break;
             }
-            // SE
-            for (int i = 1; f + i < 8 && r - i >= 0; ++i) {
-                Square s2 = make_square(f + i, r - i);
+            for (int i = 1; f+i < 8 && r-i >= 0; ++i) {
+                Square s2 = make_square(f+i, r-i);
                 attacks |= 1ULL << s2;
                 if (occ & (1ULL << s2)) break;
             }
-            // SW
-            for (int i = 1; f - i >= 0 && r - i >= 0; ++i) {
-                Square s2 = make_square(f - i, r - i);
+            for (int i = 1; f-i >= 0 && r-i >= 0; ++i) {
+                Square s2 = make_square(f-i, r-i);
                 attacks |= 1ULL << s2;
                 if (occ & (1ULL << s2)) break;
             }
@@ -463,29 +441,55 @@ void init_magics() {
     }
 }
 
+// Classical sliding attack generators — provably correct, no magic number collisions possible.
+// Magic tables are still initialised (for potential future use) but attacks are computed directly.
 U64 rook_attacks_magic(Square s, U64 occ) {
-    Magic& m = rook_magics[s];
-    occ &= m.mask;
-    occ *= m.magic;
-    occ >>= m.shift;
-    return m.attacks[occ];
+    U64 attacks = 0;
+    int f = file_of(s), r = rank_of(s);
+    for (int rr=r+1; rr<8; rr++) { U64 b=1ULL<<make_square(f,rr); attacks|=b; if(occ&b) break; }
+    for (int rr=r-1; rr>=0; rr--) { U64 b=1ULL<<make_square(f,rr); attacks|=b; if(occ&b) break; }
+    for (int ff=f+1; ff<8; ff++) { U64 b=1ULL<<make_square(ff,r); attacks|=b; if(occ&b) break; }
+    for (int ff=f-1; ff>=0; ff--) { U64 b=1ULL<<make_square(ff,r); attacks|=b; if(occ&b) break; }
+    return attacks;
 }
 
 U64 bishop_attacks_magic(Square s, U64 occ) {
-    Magic& m = bishop_magics[s];
-    occ &= m.mask;
-    occ *= m.magic;
-    occ >>= m.shift;
-    return m.attacks[occ];
+    U64 attacks = 0;
+    int f = file_of(s), r = rank_of(s);
+    for (int i=1; f+i<8&&r+i<8; i++) { U64 b=1ULL<<make_square(f+i,r+i); attacks|=b; if(occ&b) break; }
+    for (int i=1; f-i>=0&&r+i<8; i++) { U64 b=1ULL<<make_square(f-i,r+i); attacks|=b; if(occ&b) break; }
+    for (int i=1; f+i<8&&r-i>=0; i++) { U64 b=1ULL<<make_square(f+i,r-i); attacks|=b; if(occ&b) break; }
+    for (int i=1; f-i>=0&&r-i>=0; i++) { U64 b=1ULL<<make_square(f-i,r-i); attacks|=b; if(occ&b) break; }
+    return attacks;
 }
 
 U64 queen_attacks_magic(Square s, U64 occ) {
     return rook_attacks_magic(s, occ) | bishop_attacks_magic(s, occ);
 }
 
-// ============================================================================
-// Position class
-// ============================================================================
+// Zobrist hashing
+namespace Zobrist {
+    U64 pieces[2][7][64];
+    U64 side;
+    U64 castle[16];
+    U64 ep[64];
+    bool initialized = false;
+
+    void init() {
+        if (initialized) return;
+        std::mt19937_64 rng(0xDEADBEEF);
+        for (int c = 0; c < 2; ++c)
+            for (int pt = 0; pt < 7; ++pt)
+                for (int sq = 0; sq < 64; ++sq)
+                    pieces[c][pt][sq] = rng();
+        side = rng();
+        for (int i = 0; i < 16; ++i) castle[i] = rng();
+        for (int i = 0; i < 64; ++i) ep[i] = rng();
+        initialized = true;
+    }
+}
+
+// Position class (Chess960, castling undo)
 class Position {
 private:
     U64 _pieces[2][7];
@@ -496,23 +500,27 @@ private:
     int ply;
     int game_ply;
     Square ep_square;
-    int castle_rights;
+    Square castle_rook_sq[2][2];
+    bool chess960;
     U64 hash;
     std::vector<U64> history;
 
 public:
     Position() { clear(); }
     void clear() {
-        memset(_pieces,  0, sizeof(_pieces));
-        memset(board,    0, sizeof(board));
-        memset(&occupied, 0, sizeof(occupied));
-        side         = WHITE;
-        fifty        = 0;
-        ply          = 0;
-        game_ply     = 0;
-        ep_square    = -1;
-        castle_rights = 0;
-        hash         = 0;
+        memset(_pieces, 0, sizeof(_pieces));
+        memset(board, 0, sizeof(board));
+        occupied = 0;
+        side = WHITE;
+        fifty = 0;
+        ply = 0;
+        game_ply = 0;
+        ep_square = -1;
+        for (int c = 0; c < 2; ++c)
+            for (int s = 0; s < 2; ++s)
+                castle_rook_sq[c][s] = -1;
+        chess960 = false;
+        hash = 0;
         history.clear();
         history.push_back(0);
     }
@@ -539,7 +547,11 @@ public:
             board[make_square(f, 7)] = (BLACK << 3) | back[f];
         }
         update_occupied();
-        castle_rights = 1 | 2 | 4 | 8;
+        castle_rook_sq[WHITE][0] = make_square(7, 0);
+        castle_rook_sq[WHITE][1] = make_square(0, 0);
+        castle_rook_sq[BLACK][0] = make_square(7, 7);
+        castle_rook_sq[BLACK][1] = make_square(0, 7);
+        chess960 = false;
         ep_square = -1;
         game_ply = 1;
         compute_hash();
@@ -579,18 +591,52 @@ public:
         }
         side = (side_str == "w") ? WHITE : BLACK;
         update_occupied();
-        castle_rights = 0;
-        if (castle.find('K') != std::string::npos) castle_rights |= 1;
-        if (castle.find('Q') != std::string::npos) castle_rights |= 2;
-        if (castle.find('k') != std::string::npos) castle_rights |= 4;
-        if (castle.find('q') != std::string::npos) castle_rights |= 8;
-        ep_square = -1;
-        if (ep != "-") {
-            int f = ep[0] - 'a';
-            int r = ep[1] - '1';
-            ep_square = make_square(f, r);
+        for (int c = 0; c < 2; ++c)
+            for (int s = 0; s < 2; ++s)
+                castle_rook_sq[c][s] = -1;
+        if (castle != "-") {
+            for (char ch : castle) {
+                Color col = isupper(ch) ? WHITE : BLACK;
+                int rank = (col == WHITE) ? 0 : 7;
+                char lch = tolower(ch);
+                int file = -1;
+                if (lch == 'k') {
+                    // Standard FEN kingside: find the first rook to the right of the king
+                    Square ksq = lsb(_pieces[col][KING]);
+                    for (int f = file_of(ksq) + 1; f < 8; ++f) {
+                        if (_pieces[col][ROOK] & (1ULL << make_square(f, rank))) {
+                            file = f; break;
+                        }
+                    }
+                } else if (lch == 'q') {
+                    // Standard FEN queenside: find the first rook to the left of the king
+                    Square ksq = lsb(_pieces[col][KING]);
+                    for (int f = file_of(ksq) - 1; f >= 0; --f) {
+                        if (_pieces[col][ROOK] & (1ULL << make_square(f, rank))) {
+                            file = f; break;
+                        }
+                    }
+                } else {
+                    // Chess960 Shredder-FEN: file letter directly encodes the rook file
+                    file = lch - 'a';
+                }
+                if (file < 0 || file > 7) continue;
+                Square rook_sq = make_square(file, rank);
+                if ((_pieces[col][ROOK] & (1ULL << rook_sq)) == 0) continue;
+                Square ksq = lsb(_pieces[col][KING]);
+                int side_idx = (file > file_of(ksq)) ? 0 : 1;
+                castle_rook_sq[col][side_idx] = rook_sq;
+            }
         }
+        chess960 = (castle_rook_sq[WHITE][0] != make_square(7,0) ||
+                    castle_rook_sq[WHITE][1] != make_square(0,0) ||
+                    castle_rook_sq[BLACK][0] != make_square(7,7) ||
+                    castle_rook_sq[BLACK][1] != make_square(0,7));
+        ep_square = (ep != "-") ? make_square(ep[0]-'a', ep[1]-'1') : -1;
         fifty = hmvc;
+        // game_ply is a fullmove counter: incremented once after BLACK's move
+        // (when side flips back to WHITE), so it must be initialised to the FEN
+        // fullmove number directly — not converted to a ply index.
         game_ply = fmvn;
         compute_hash();
         history.clear();
@@ -612,16 +658,7 @@ public:
                     }
                     Color c = Color(pc >> 3);
                     PieceType pt = PieceType(pc & 7);
-                    char p = ' ';
-                    switch (pt) {
-                        case PAWN:   p = 'p'; break;
-                        case KNIGHT: p = 'n'; break;
-                        case BISHOP: p = 'b'; break;
-                        case ROOK:   p = 'r'; break;
-                        case QUEEN:  p = 'q'; break;
-                        case KING:   p = 'k'; break;
-                        default: break;
-                    }
+                    char p = " pnbrqk"[pt];
                     if (c == WHITE) p = toupper(p);
                     fen += p;
                 }
@@ -631,37 +668,29 @@ public:
         }
         fen += (side == WHITE) ? " w " : " b ";
         std::string castle_str;
-        if (castle_rights & 1) castle_str += 'K';
-        if (castle_rights & 2) castle_str += 'Q';
-        if (castle_rights & 4) castle_str += 'k';
-        if (castle_rights & 8) castle_str += 'q';
-        if (castle_str.empty()) castle_str = '-';
+        if (!chess960) {
+            // Standard FEN: K=white kingside, Q=white queenside, k=black kingside, q=black queenside
+            if (castle_rook_sq[WHITE][0] != -1) castle_str += 'K';
+            if (castle_rook_sq[WHITE][1] != -1) castle_str += 'Q';
+            if (castle_rook_sq[BLACK][0] != -1) castle_str += 'k';
+            if (castle_rook_sq[BLACK][1] != -1) castle_str += 'q';
+        } else {
+            // Chess960 Shredder-FEN: uppercase file letter for white, lowercase for black
+            for (int c = 0; c < 2; ++c) {
+                for (int s = 0; s < 2; ++s) {
+                    Square rsq = castle_rook_sq[Color(c)][s];
+                    if (rsq != -1) {
+                        char file_char = char('a' + file_of(rsq));
+                        castle_str += (c == WHITE) ? char(toupper(file_char)) : file_char;
+                    }
+                }
+            }
+        }
+        if (castle_str.empty()) castle_str = "-";
         fen += castle_str + " ";
-        if (ep_square != -1)
-            fen += char('a' + file_of(ep_square)) + std::to_string(rank_of(ep_square) + 1);
-        else
-            fen += '-';
+        fen += (ep_square != -1) ? std::string(1, 'a' + file_of(ep_square)) + std::to_string(rank_of(ep_square)+1) : "-";
         fen += " " + std::to_string(fifty) + " " + std::to_string(game_ply);
         return fen;
-    }
-
-    static U64 zobrist_pieces[2][7][64];
-    static U64 zobrist_side;
-    static U64 zobrist_castle[16];
-    static U64 zobrist_ep[64];
-    static bool zobrist_initialized;
-
-    static void init_zobrist() {
-        if (zobrist_initialized) return;
-        std::mt19937_64 rng(0xDEADBEEF);
-        for (int c = 0; c < 2; ++c)
-            for (int pt = 0; pt < 7; ++pt)
-                for (int sq = 0; sq < 64; ++sq)
-                    zobrist_pieces[c][pt][sq] = rng();
-        zobrist_side = rng();
-        for (int i = 0; i < 16; ++i) zobrist_castle[i] = rng();
-        for (int i = 0; i < 64; ++i) zobrist_ep[i] = rng();
-        zobrist_initialized = true;
     }
 
     void compute_hash() {
@@ -671,13 +700,17 @@ public:
                 U64 bb = _pieces[c][pt];
                 while (bb) {
                     Square sq = pop_lsb(bb);
-                    h ^= zobrist_pieces[c][pt][sq];
+                    h ^= Zobrist::pieces[c][pt][sq];
                 }
             }
-        if (side == BLACK) h ^= zobrist_side;
-        h ^= zobrist_castle[castle_rights & 15];
-        if (ep_square != -1)
-            h ^= zobrist_ep[ep_square];
+        if (side == BLACK) h ^= Zobrist::side;
+        int castle_mask = 0;
+        if (castle_rook_sq[WHITE][0] != -1) castle_mask |= 1;
+        if (castle_rook_sq[WHITE][1] != -1) castle_mask |= 2;
+        if (castle_rook_sq[BLACK][0] != -1) castle_mask |= 4;
+        if (castle_rook_sq[BLACK][1] != -1) castle_mask |= 8;
+        h ^= Zobrist::castle[castle_mask];
+        if (ep_square != -1) h ^= Zobrist::ep[ep_square];
         hash = h;
     }
     U64 get_hash() const { return hash; }
@@ -692,28 +725,19 @@ public:
     void push_hash() { history.push_back(hash); }
     void pop_hash() { history.pop_back(); }
 
-    // attacks_to using current occupancy
-    U64 attacks_to(Square s) const {
-        return attacks_to(s, occupied);
-    }
-
-    // attacks_to using custom occupancy (for SEE)
+    U64 attacks_to(Square s) const { return attacks_to(s, occupied); }
     U64 attacks_to(Square s, U64 occ) const {
         U64 attackers = 0;
         attackers |= Bitboards::pawn_attacks[BLACK][s] & _pieces[WHITE][PAWN];
         attackers |= Bitboards::pawn_attacks[WHITE][s] & _pieces[BLACK][PAWN];
         attackers |= Bitboards::knight_attacks[s] & (_pieces[WHITE][KNIGHT] | _pieces[BLACK][KNIGHT]);
-
         U64 bishops = _pieces[WHITE][BISHOP] | _pieces[BLACK][BISHOP] | _pieces[WHITE][QUEEN] | _pieces[BLACK][QUEEN];
         attackers |= bishop_attacks_magic(s, occ) & bishops;
-
         U64 rooks = _pieces[WHITE][ROOK] | _pieces[BLACK][ROOK] | _pieces[WHITE][QUEEN] | _pieces[BLACK][QUEEN];
         attackers |= rook_attacks_magic(s, occ) & rooks;
-
         attackers |= Bitboards::king_attacks[s] & (_pieces[WHITE][KING] | _pieces[BLACK][KING]);
         return attackers;
     }
-
     bool is_check() const {
         if (!_pieces[side][KING]) return false;
         Square ksq = lsb(_pieces[side][KING]);
@@ -738,48 +762,84 @@ public:
         return std::min(phase, TOTAL_PHASE);
     }
     bool is_endgame() const { return game_phase() < 12; }
+    // Returns the king's square. Returns NO_SQUARE (-1) if the king is missing
+    // (can happen in positions constructed for evaluation tests or after illegal moves).
+    Square king_square(Color c) const {
+        if (!_pieces[c][KING]) return Square(-1);  // no-king sentinel
+        return lsb(_pieces[c][KING]);
+    }
 
-    // --- FIX: SEE with proper occupancy updates for X‑rays ---
     Value see(Move m) const {
         if (m == NULL_MOVE) return 0;
         Square from = from_sq(m), to = to_sq(m);
-        int victim_type = board[to] & 7;
-        if (victim_type == 0) return 0;
+        U64 occ = occupied;
+        Color us = side;
+        bool ep = is_en_passant(m);
+        bool promo = promotion_type(m) != NO_PIECE;
+        PieceType prom_type = promotion_type(m);
+
+        // Remove the initial attacker from the occupancy map
+        occ &= ~(1ULL << from);
+
+        // Determine the victim's piece type and update occ accordingly
+        int victim_type = 0;
+        if (ep) {
+            Square ep_cap = to + (us == WHITE ? -8 : 8);
+            victim_type = PAWN;
+            occ &= ~(1ULL << ep_cap);  // captured pawn leaves the board
+        } else {
+            int captured = board[to];
+            if (captured) {
+                victim_type = captured & 7;
+                occ &= ~(1ULL << to);  // victim leaves before we place our piece
+            }
+        }
+
+        // Initial attacker's piece type (promotion changes what's placed on to)
+        int piece_on_sq = promo ? int(prom_type) : int(board[from] & 7);
+        // Place the initial attacker on the target square
+        occ |= (1ULL << to);
+
+        if (victim_type == 0) return 0;  // nothing to capture (shouldn't happen for captures)
 
         Value gain[32];
         int d = 0;
-        gain[d] = PIECE_VALUES[victim_type];
-        U64 occ = occupied;
-        Color stm = Color(side ^ 1);
-        occ ^= (1ULL << from);
-        occ ^= (1ULL << to);
+        gain[0] = PIECE_VALUES[victim_type];
 
+        // Alternate between sides. Each recapture gains the piece currently on to
+        // (= the last attacker placed there), minus what the previous side gained.
+        Color stm = Color(us ^ 1);  // opponent responds first
         while (true) {
-            int best_att = 0;
+            // Find cheapest attacker for stm that can reach 'to' given current occ
+            int best_att_type = 0;
             Square best_sq = -1;
             for (int pt = PAWN; pt <= KING; ++pt) {
-                U64 attackers = _pieces[stm][pt] & occ & attacks_to(to, occ); // use local occ
+                U64 attackers = _pieces[stm][pt] & occ & attacks_to(to, occ);
                 if (attackers) {
-                    best_att = pt;
+                    best_att_type = pt;
                     best_sq = lsb(attackers);
                     break;
                 }
             }
-            if (best_sq == -1) break;
+            if (best_sq == -1) break;  // no more recaptures possible
+
             d++;
-            gain[d] = PIECE_VALUES[best_att] - gain[d-1];
-            occ ^= (1ULL << best_sq);
+            // The current side captures 'piece_on_sq' (what the last side placed on to)
+            gain[d] = PIECE_VALUES[piece_on_sq] - gain[d-1];
+            // Update occ: attacker leaves its square, and is placed on 'to'
+            occ &= ~(1ULL << best_sq);
+            piece_on_sq = best_att_type;  // now this piece is on 'to'
             stm = Color(stm ^ 1);
         }
+
+        // Roll back: each side only makes the capture if it gains material
         while (d > 0) {
             gain[d-1] = -std::max(-gain[d-1], gain[d]);
             d--;
         }
         return gain[0];
     }
-
     bool gives_check(Move m) const {
-        if (m == NULL_MOVE) return false;
         Position copy = *this;
         copy.make_move(m);
         return copy.is_check();
@@ -803,29 +863,19 @@ public:
         _pieces[us][pt] ^= 1ULL << from;
         board[from] = 0;
         if (is_castling(m)) {
-            if (to == make_square(6,0)) {
-                _pieces[us][ROOK] ^= 1ULL << make_square(7,0);
-                _pieces[us][ROOK] |= 1ULL << make_square(5,0);
-                board[make_square(7,0)] = 0;
-                board[make_square(5,0)] = (us << 3) | ROOK;
-            } else if (to == make_square(2,0)) {
-                _pieces[us][ROOK] ^= 1ULL << make_square(0,0);
-                _pieces[us][ROOK] |= 1ULL << make_square(3,0);
-                board[make_square(0,0)] = 0;
-                board[make_square(3,0)] = (us << 3) | ROOK;
-            } else if (to == make_square(6,7)) {
-                _pieces[us][ROOK] ^= 1ULL << make_square(7,7);
-                _pieces[us][ROOK] |= 1ULL << make_square(5,7);
-                board[make_square(7,7)] = 0;
-                board[make_square(5,7)] = (us << 3) | ROOK;
-            } else if (to == make_square(2,7)) {
-                _pieces[us][ROOK] ^= 1ULL << make_square(0,7);
-                _pieces[us][ROOK] |= 1ULL << make_square(3,7);
-                board[make_square(0,7)] = 0;
-                board[make_square(3,7)] = (us << 3) | ROOK;
-            }
+            int side_idx = (to > from) ? 0 : 1;
+            Square rook_sq = castle_rook_sq[us][side_idx];
+            // Rook always lands on f-file (kingside) or d-file (queenside) after castling,
+            // regardless of where the king or rook started (correct for both standard and Chess960).
+            int castling_rank_mk = (us == WHITE) ? 0 : 7;
+            Square rook_dest = make_square((side_idx == 0) ? 5 : 3, castling_rank_mk);
+            _pieces[us][ROOK] ^= (1ULL << rook_sq);
+            _pieces[us][ROOK] |= (1ULL << rook_dest);
+            board[rook_sq] = 0;
+            board[rook_dest] = (us << 3) | ROOK;
+            castle_rook_sq[us][side_idx] = -1;
         } else if (is_en_passant(m)) {
-            Square ep_cap = to + ((us == WHITE) ? -8 : 8);
+            Square ep_cap = to + (us == WHITE ? -8 : 8);
             int ep_pc = board[ep_cap];
             if (ep_pc) {
                 int ep_pt = ep_pc & 7;
@@ -836,7 +886,7 @@ public:
         }
         _pieces[us][pt] |= 1ULL << to;
         board[to] = pc;
-        if (captured && !is_en_passant(m)) {
+        if (captured && !is_en_passant(m) && !is_castling(m)) {
             int cap_pt = captured & 7;
             _pieces[them][cap_pt] ^= 1ULL << to;
         }
@@ -847,22 +897,18 @@ public:
             board[to] = (us << 3) | prom;
         }
         if (pt == KING) {
-            if (us == WHITE) castle_rights &= ~(1 | 2);
-            else castle_rights &= ~(4 | 8);
+            castle_rook_sq[us][0] = castle_rook_sq[us][1] = -1;
         }
-        if (from == make_square(0,0)) castle_rights &= ~2;
-        if (from == make_square(7,0)) castle_rights &= ~1;
-        if (from == make_square(0,7)) castle_rights &= ~8;
-        if (from == make_square(7,7)) castle_rights &= ~4;
+        for (int s = 0; s < 2; ++s) {
+            if (from == castle_rook_sq[us][s]) castle_rook_sq[us][s] = -1;
+            if (from == castle_rook_sq[them][s]) castle_rook_sq[them][s] = -1;
+        }
         if (pt == PAWN && abs(to - from) == 16) {
             ep_square = (us == WHITE) ? from + 8 : from - 8;
         } else {
             ep_square = -1;
         }
-        if (captured || pt == PAWN)
-            fifty = 0;
-        else
-            fifty++;
+        if (captured || pt == PAWN) fifty = 0; else fifty++;
         update_occupied();
         side = them;
         ply++;
@@ -880,10 +926,7 @@ public:
     }
 
     void undo_move(Move m, int captured, int old_castle, int old_ep, int old_fifty) {
-        if (m == NULL_MOVE) {
-            undo_null_move();
-            return;
-        }
+        if (m == NULL_MOVE) { undo_null_move(); return; }
         side = Color(side ^ 1);
         Square from = from_sq(m), to = to_sq(m);
         int pc = board[to];
@@ -893,35 +936,27 @@ public:
         board[to] = captured;
         _pieces[us][pt] |= 1ULL << from;
         board[from] = (us << 3) | pt;
-        if (captured && !is_en_passant(m)) {
+        if (captured && !is_en_passant(m) && !is_castling(m)) {
             int cap_pt = captured & 7;
             Color them = Color(us ^ 1);
             _pieces[them][cap_pt] |= 1ULL << to;
         }
         if (is_castling(m)) {
-            if (to == make_square(6,0)) {
-                _pieces[us][ROOK] ^= 1ULL << make_square(5,0);
-                _pieces[us][ROOK] |= 1ULL << make_square(7,0);
-                board[make_square(5,0)] = 0;
-                board[make_square(7,0)] = (us << 3) | ROOK;
-            } else if (to == make_square(2,0)) {
-                _pieces[us][ROOK] ^= 1ULL << make_square(3,0);
-                _pieces[us][ROOK] |= 1ULL << make_square(0,0);
-                board[make_square(3,0)] = 0;
-                board[make_square(0,0)] = (us << 3) | ROOK;
-            } else if (to == make_square(6,7)) {
-                _pieces[us][ROOK] ^= 1ULL << make_square(5,7);
-                _pieces[us][ROOK] |= 1ULL << make_square(7,7);
-                board[make_square(5,7)] = 0;
-                board[make_square(7,7)] = (us << 3) | ROOK;
-            } else if (to == make_square(2,7)) {
-                _pieces[us][ROOK] ^= 1ULL << make_square(3,7);
-                _pieces[us][ROOK] |= 1ULL << make_square(0,7);
-                board[make_square(3,7)] = 0;
-                board[make_square(0,7)] = (us << 3) | ROOK;
-            }
+            // Recover original rook square directly from old_castle (packed encoding).
+            int side_idx = (to > from) ? 0 : 1;
+            auto dec = [](int v) -> Square { return Square((v & 0x7F) - 1); };
+            Square orig_rook_sq = (side_idx == 0) ? dec(old_castle) : dec(old_castle >> 7);
+            if (us == BLACK) orig_rook_sq = (side_idx == 0) ? dec(old_castle >> 14) : dec(old_castle >> 21);
+            // Rook always lands on f-file (kingside) or d-file (queenside) after castling,
+            // regardless of the king's original file (critical for Chess960 correctness).
+            int castling_rank = (us == WHITE) ? 0 : 7;
+            Square rook_dest = make_square((side_idx == 0) ? 5 : 3, castling_rank);
+            _pieces[us][ROOK] ^= (1ULL << rook_dest);
+            _pieces[us][ROOK] |= (1ULL << orig_rook_sq);
+            board[rook_dest] = 0;
+            board[orig_rook_sq] = (us << 3) | ROOK;
         } else if (is_en_passant(m)) {
-            Square ep_cap = to + ((us == WHITE) ? -8 : 8);
+            Square ep_cap = to + (us == WHITE ? -8 : 8);
             _pieces[us^1][PAWN] |= 1ULL << ep_cap;
             board[ep_cap] = ((us^1) << 3) | PAWN;
         }
@@ -930,7 +965,8 @@ public:
             _pieces[us][PAWN] |= 1ULL << from;
             board[from] = (us << 3) | PAWN;
         }
-        castle_rights = old_castle;
+        // Restore castling rights exactly from packed old_castle — no back-rank scanning.
+        restore_castling_rights(old_castle);
         ep_square = old_ep;
         fifty = old_fifty;
         update_occupied();
@@ -947,169 +983,125 @@ public:
     int halfmove_clock() const { return fifty; }
     int fullmove_number() const { return game_ply; }
     Square ep_sq() const { return ep_square; }
-    int castling_rights() const { return castle_rights; }
-
+    Square castle_rook(Color c, int side) const { return castle_rook_sq[c][side]; }
+    int castling_rights() const {
+        // Pack all 4 rook squares into a 32-bit int.
+        // Each slot occupies 7 bits: (square+1), where 0 means "no right" (-1+1=0).
+        // Layout: bits 0-6 = WHITE[0], bits 7-13 = WHITE[1],
+        //         bits 14-20 = BLACK[0], bits 21-27 = BLACK[1].
+        auto enc = [](Square sq) { return (sq + 1) & 0x7F; };
+        return  enc(castle_rook_sq[WHITE][0])
+             | (enc(castle_rook_sq[WHITE][1]) << 7)
+             | (enc(castle_rook_sq[BLACK][0]) << 14)
+             | (enc(castle_rook_sq[BLACK][1]) << 21);
+    }
+    // Restore castle_rook_sq[] from a value previously returned by castling_rights()
+    void restore_castling_rights(int packed) {
+        auto dec = [](int v) -> Square { return Square((v & 0x7F) - 1); };
+        castle_rook_sq[WHITE][0] = dec(packed);
+        castle_rook_sq[WHITE][1] = dec(packed >> 7);
+        castle_rook_sq[BLACK][0] = dec(packed >> 14);
+        castle_rook_sq[BLACK][1] = dec(packed >> 21);
+    }
     bool mover_in_check() const {
-        Color prev_mover = Color(side ^ 1);
-        if (!_pieces[prev_mover][KING]) return false;
-        Square ksq = lsb(_pieces[prev_mover][KING]);
+        Color prev = Color(side ^ 1);
+        if (!_pieces[prev][KING]) return false;
+        Square ksq = lsb(_pieces[prev][KING]);
         return is_attacked(ksq, side);
     }
+    bool is_chess960() const { return chess960; }
+    void set_chess960(bool v) { chess960 = v; }
 };
 
-U64 Position::zobrist_pieces[2][7][64];
-U64 Position::zobrist_side;
-U64 Position::zobrist_castle[16];
-U64 Position::zobrist_ep[64];
-bool Position::zobrist_initialized = false;
-
-// ============================================================================
-// Move generation – fixed: no king captures, correct separation of captures/non‑captures
-// ============================================================================
+// Move generation
 int generate_moves(const Position& pos, Move* moves, bool captures_only = false) {
     int count = 0;
     Color us = pos.side_to_move();
     Color them = Color(us ^ 1);
-
-    // Opponent pieces excluding their king (can never capture the king)
     U64 their_pieces_no_king = pos.bb(them, PAWN) | pos.bb(them, KNIGHT) | pos.bb(them, BISHOP) |
                                 pos.bb(them, ROOK) | pos.bb(them, QUEEN);
     U64 empty = ~pos.occupied_bb();
 
-    // Knights
     U64 knights = pos.bb(us, KNIGHT);
     while (knights) {
         Square from = pop_lsb(knights);
         U64 attacks = Bitboards::knight_attacks[from];
         if (captures_only) {
             U64 caps = attacks & their_pieces_no_king;
-            while (caps) {
-                Square to = pop_lsb(caps);
-                moves[count++] = make_move(from, to);
-            }
+            while (caps) { Square to = pop_lsb(caps); moves[count++] = make_move(from, to); }
         } else {
             U64 caps = attacks & their_pieces_no_king;
-            while (caps) {
-                Square to = pop_lsb(caps);
-                moves[count++] = make_move(from, to);
-            }
+            while (caps) { Square to = pop_lsb(caps); moves[count++] = make_move(from, to); }
             U64 noncaps = attacks & empty;
-            while (noncaps) {
-                Square to = pop_lsb(noncaps);
-                moves[count++] = make_move(from, to);
-            }
+            while (noncaps) { Square to = pop_lsb(noncaps); moves[count++] = make_move(from, to); }
         }
     }
 
-    // Bishops
     U64 bishops = pos.bb(us, BISHOP);
     while (bishops) {
         Square from = pop_lsb(bishops);
         U64 attacks = bishop_attacks_magic(from, pos.occupied_bb());
         if (captures_only) {
             U64 caps = attacks & their_pieces_no_king;
-            while (caps) {
-                Square to = pop_lsb(caps);
-                moves[count++] = make_move(from, to);
-            }
+            while (caps) { Square to = pop_lsb(caps); moves[count++] = make_move(from, to); }
         } else {
             U64 caps = attacks & their_pieces_no_king;
-            while (caps) {
-                Square to = pop_lsb(caps);
-                moves[count++] = make_move(from, to);
-            }
+            while (caps) { Square to = pop_lsb(caps); moves[count++] = make_move(from, to); }
             U64 noncaps = attacks & empty;
-            while (noncaps) {
-                Square to = pop_lsb(noncaps);
-                moves[count++] = make_move(from, to);
-            }
+            while (noncaps) { Square to = pop_lsb(noncaps); moves[count++] = make_move(from, to); }
         }
     }
 
-    // Rooks
     U64 rooks = pos.bb(us, ROOK);
     while (rooks) {
         Square from = pop_lsb(rooks);
         U64 attacks = rook_attacks_magic(from, pos.occupied_bb());
         if (captures_only) {
             U64 caps = attacks & their_pieces_no_king;
-            while (caps) {
-                Square to = pop_lsb(caps);
-                moves[count++] = make_move(from, to);
-            }
+            while (caps) { Square to = pop_lsb(caps); moves[count++] = make_move(from, to); }
         } else {
             U64 caps = attacks & their_pieces_no_king;
-            while (caps) {
-                Square to = pop_lsb(caps);
-                moves[count++] = make_move(from, to);
-            }
+            while (caps) { Square to = pop_lsb(caps); moves[count++] = make_move(from, to); }
             U64 noncaps = attacks & empty;
-            while (noncaps) {
-                Square to = pop_lsb(noncaps);
-                moves[count++] = make_move(from, to);
-            }
+            while (noncaps) { Square to = pop_lsb(noncaps); moves[count++] = make_move(from, to); }
         }
     }
 
-    // Queens
     U64 queens = pos.bb(us, QUEEN);
     while (queens) {
         Square from = pop_lsb(queens);
         U64 attacks = queen_attacks_magic(from, pos.occupied_bb());
         if (captures_only) {
             U64 caps = attacks & their_pieces_no_king;
-            while (caps) {
-                Square to = pop_lsb(caps);
-                moves[count++] = make_move(from, to);
-            }
+            while (caps) { Square to = pop_lsb(caps); moves[count++] = make_move(from, to); }
         } else {
             U64 caps = attacks & their_pieces_no_king;
-            while (caps) {
-                Square to = pop_lsb(caps);
-                moves[count++] = make_move(from, to);
-            }
+            while (caps) { Square to = pop_lsb(caps); moves[count++] = make_move(from, to); }
             U64 noncaps = attacks & empty;
-            while (noncaps) {
-                Square to = pop_lsb(noncaps);
-                moves[count++] = make_move(from, to);
-            }
+            while (noncaps) { Square to = pop_lsb(noncaps); moves[count++] = make_move(from, to); }
         }
     }
 
-    // King – cannot capture the opponent king, already excluded
     if (pos.bb(us, KING)) {
         Square from = lsb(pos.bb(us, KING));
         U64 attacks = Bitboards::king_attacks[from];
         if (captures_only) {
             U64 caps = attacks & their_pieces_no_king;
-            while (caps) {
-                Square to = pop_lsb(caps);
-                moves[count++] = make_move(from, to);
-            }
+            while (caps) { Square to = pop_lsb(caps); moves[count++] = make_move(from, to); }
         } else {
             U64 caps = attacks & their_pieces_no_king;
-            while (caps) {
-                Square to = pop_lsb(caps);
-                moves[count++] = make_move(from, to);
-            }
+            while (caps) { Square to = pop_lsb(caps); moves[count++] = make_move(from, to); }
             U64 noncaps = attacks & empty;
-            while (noncaps) {
-                Square to = pop_lsb(noncaps);
-                moves[count++] = make_move(from, to);
-            }
+            while (noncaps) { Square to = pop_lsb(noncaps); moves[count++] = make_move(from, to); }
         }
     }
 
-    // Pawns
     U64 pawns = pos.bb(us, PAWN);
     int forward = (us == WHITE) ? 8 : -8;
-    U64 promo_rank = (us == WHITE) ? 0xFF00000000000000ULL : 0xFFULL; // rank 7 for white, rank 0 for black
-
+    U64 promo_rank = (us == WHITE) ? 0xFF00000000000000ULL : 0xFFULL;
     while (pawns) {
         Square from = pop_lsb(pawns);
         Square to = from + forward;
-
-        // Non‑capture pawn pushes
         if (!captures_only && to >= 0 && to < 64 && !pos.piece_on(to)) {
             if (promo_rank & (1ULL << to)) {
                 moves[count++] = make_promotion(from, to, QUEEN);
@@ -1118,16 +1110,12 @@ int generate_moves(const Position& pos, Move* moves, bool captures_only = false)
                 moves[count++] = make_promotion(from, to, KNIGHT);
             } else {
                 moves[count++] = make_move(from, to);
-                // Double push
                 if ((us == WHITE && rank_of(from) == 1) || (us == BLACK && rank_of(from) == 6)) {
                     Square to2 = from + 2*forward;
-                    if (!pos.piece_on(to2))
-                        moves[count++] = make_move(from, to2);
+                    if (!pos.piece_on(to2)) moves[count++] = make_move(from, to2);
                 }
             }
         }
-
-        // Pawn captures
         U64 attacks = Bitboards::pawn_attacks[us][from] & their_pieces_no_king;
         while (attacks) {
             Square to_cap = pop_lsb(attacks);
@@ -1140,58 +1128,78 @@ int generate_moves(const Position& pos, Move* moves, bool captures_only = false)
                 moves[count++] = make_move(from, to_cap);
             }
         }
-
-        // En passant
         if (pos.ep_sq() != -1) {
             U64 ep_attacks = Bitboards::pawn_attacks[us][from] & (1ULL << pos.ep_sq());
-            if (ep_attacks) {
-                moves[count++] = make_move(from, pos.ep_sq()) | ENPASSANT_FLAG;
-            }
+            if (ep_attacks) moves[count++] = make_move(from, pos.ep_sq()) | ENPASSANT_FLAG;
         }
     }
 
-    // Castling (only if not captures_only)
-    if (!captures_only && !pos.is_check()) {
-        if (us == WHITE) {
-            if ((pos.castling_rights() & 1) &&
-                !(pos.occupied_bb() & (1ULL << make_square(5,0))) &&
-                !(pos.occupied_bb() & (1ULL << make_square(6,0))) &&
-                !pos.is_attacked(make_square(4,0), BLACK) &&
-                !pos.is_attacked(make_square(5,0), BLACK) &&
-                !pos.is_attacked(make_square(6,0), BLACK))
-                moves[count++] = make_move(make_square(4,0), make_square(6,0)) | CASTLE_FLAG;
-            if ((pos.castling_rights() & 2) &&
-                !(pos.occupied_bb() & (1ULL << make_square(3,0))) &&
-                !(pos.occupied_bb() & (1ULL << make_square(2,0))) &&
-                !(pos.occupied_bb() & (1ULL << make_square(1,0))) &&
-                !pos.is_attacked(make_square(4,0), BLACK) &&
-                !pos.is_attacked(make_square(3,0), BLACK) &&
-                !pos.is_attacked(make_square(2,0), BLACK))
-                moves[count++] = make_move(make_square(4,0), make_square(2,0)) | CASTLE_FLAG;
-        } else {
-            if ((pos.castling_rights() & 4) &&
-                !(pos.occupied_bb() & (1ULL << make_square(5,7))) &&
-                !(pos.occupied_bb() & (1ULL << make_square(6,7))) &&
-                !pos.is_attacked(make_square(4,7), WHITE) &&
-                !pos.is_attacked(make_square(5,7), WHITE) &&
-                !pos.is_attacked(make_square(6,7), WHITE))
-                moves[count++] = make_move(make_square(4,7), make_square(6,7)) | CASTLE_FLAG;
-            if ((pos.castling_rights() & 8) &&
-                !(pos.occupied_bb() & (1ULL << make_square(3,7))) &&
-                !(pos.occupied_bb() & (1ULL << make_square(2,7))) &&
-                !(pos.occupied_bb() & (1ULL << make_square(1,7))) &&
-                !pos.is_attacked(make_square(4,7), WHITE) &&
-                !pos.is_attacked(make_square(3,7), WHITE) &&
-                !pos.is_attacked(make_square(2,7), WHITE))
-                moves[count++] = make_move(make_square(4,7), make_square(2,7)) | CASTLE_FLAG;
+    if (!captures_only && !pos.is_check() && pos.bb(us, KING)) {
+        for (int side_idx = 0; side_idx < 2; ++side_idx) {
+            Square rook_sq = pos.castle_rook(us, side_idx);
+            if (rook_sq == -1) continue;
+            Square ksq = lsb(pos.bb(us, KING));
+            if ((pos.bb(us, ROOK) & (1ULL << rook_sq)) == 0) continue;
+
+            int castling_rank_gen = (us == WHITE) ? 0 : 7;
+            // King always ends up on g-file (kingside) or c-file (queenside).
+            // Rook always ends up on f-file (kingside) or d-file (queenside).
+            // These are fixed by FIDE rules for both standard and Chess960.
+            Square king_dest = make_square((side_idx == 0) ? 6 : 2, castling_rank_gen);
+            Square rook_dest = make_square((side_idx == 0) ? 5 : 3, castling_rank_gen);
+
+            // Chess960 sanity: rook must be on same side of king as expected
+            bool rook_on_correct_side = (side_idx == 0) ? (rook_sq > ksq) : (rook_sq < ksq);
+            if (!rook_on_correct_side) continue;
+
+            bool ok = true;
+
+            // ---- King's path clearance ----
+            // Every square strictly between king and king_dest must be:
+            //   (a) empty or occupied only by the castling rook
+            //   (b) not attacked by the opponent
+            // Special case: king_dest == ksq means king doesn't move (e.g. Chess960
+            // king on g-file tries to castle kingside) — no path to check.
+            if (king_dest != ksq) {
+                int step = (king_dest > ksq) ? 1 : -1;
+                for (Square s = ksq + step; s != king_dest; s += step) {
+                    if (pos.piece_on(s) != 0 && s != rook_sq) { ok = false; break; }
+                    if (pos.is_attacked(s, them)) { ok = false; break; }
+                }
+                if (ok && pos.piece_on(king_dest) != 0 && king_dest != rook_sq) ok = false;
+                if (ok && pos.is_attacked(king_dest, them)) ok = false;
+            }
+
+            // ---- Rook's path clearance ----
+            // Every square strictly between rook_sq and rook_dest must be empty
+            // (ignoring the king's original square, which is vacated during castling).
+            // Special case: rook_dest == rook_sq means rook doesn't move — fine.
+            if (ok && rook_dest != rook_sq) {
+                int step = (rook_dest > rook_sq) ? 1 : -1;
+                for (Square s = rook_sq + step; s != rook_dest; s += step) {
+                    if (s == ksq) continue;  // king vacates this square
+                    if (pos.piece_on(s) != 0) { ok = false; break; }
+                }
+            }
+
+            // King must not start the castling move in check
+            if (ok && pos.is_attacked(ksq, them)) ok = false;
+
+            if (ok) moves[count++] = make_move(ksq, king_dest) | CASTLE_FLAG;
         }
     }
     return count;
 }
+// ============================================================================
+// End of Part 1
+// ============================================================================
+// ============================================================================
+// Part 2 of 4: Hugine 2.0 – Evaluation, NNUE, Tables, Global State
+// ============================================================================
 
-// ============================================================================
-// Piece‑square tables
-// ============================================================================
+// ----------------------------------------------------------------------------
+// Piece‑square tables (midgame and endgame combined)
+// ----------------------------------------------------------------------------
 constexpr int PST_PAWN[64] = {
     0,0,0,0,0,0,0,0,50,50,50,50,50,50,50,50,
     10,10,20,30,30,20,10,10,5,5,10,25,25,10,5,5,
@@ -1234,75 +1242,86 @@ constexpr int PST_KING_EG[64] = {
     -30,-20,-10,0,0,-10,-20,-30,-50,-40,-30,-20,-20,-30,-40,-50
 };
 
-// ============================================================================
-// NNUE evaluator (optional)
-// ============================================================================
 #ifdef USE_NNUE
+// ----------------------------------------------------------------------------
+// NNUE evaluator (HalfKP, int8, SIMD, incremental)
+// ----------------------------------------------------------------------------
 class NNUEEvaluator {
-private:
+public:
+    static constexpr int FT_INPUTS = 40960;   // 2 * 64 * 64 * 5
     static constexpr int FT_SIZE = 256;
     static constexpr int L1_SIZE = 32;
     static constexpr int L2_SIZE = 32;
-    static constexpr int INPUT_SIZE = 768;
+    static constexpr int FT_SCALE = 128;
+    static constexpr int HIDDEN_SCALE = 64;
+
+private:
     struct Layer {
-        std::vector<int16_t> weights;
+        std::vector<int8_t> weights;
         std::vector<int16_t> bias;
     };
     Layer ft, l1, l2, output;
     int16_t output_bias;
+
     struct Accumulator {
         std::vector<int16_t> values;
+        Square king_sq;
+        Color king_color;
         bool computed;
-    } acc[2];
-    int piece_index(PieceType pt, Color c) const {
-        return (pt - 1) * 2 + (c == WHITE ? 0 : 1);
+        Accumulator() : values(FT_SIZE, 0), king_sq(NO_SQUARE), king_color(WHITE), computed(false) {}
+    };
+
+    struct ThreadData {
+        std::vector<Accumulator> stack[2];
+    };
+    static thread_local ThreadData tls;
+
+    static int feature_index(Color perspective_king_color, Square king_sq, Color piece_color, Square piece_sq, PieceType pt) {
+        if (pt == KING) return -1;
+        int piece_idx = (piece_color == perspective_king_color) ? 0 : 1;
+        return (piece_idx * 64 * 64 * 5) + (king_sq * 64 + piece_sq) * 5 + (pt - 1);
     }
-    void refresh_accumulator(const Position& pos, int perspective) {
-        auto& a = acc[perspective];
-        a.values.assign(FT_SIZE, 0);
-        for (int i = 0; i < FT_SIZE; ++i) a.values[i] = ft.bias[i];
-        for (Square sq = 0; sq < 64; ++sq) {
-            int pc = pos.piece_on(sq);
-            if (pc == 0) continue;
-            Color c = Color(pc >> 3);
-            PieceType pt = PieceType(pc & 7);
-            int idx = piece_index(pt, c) * 64 + sq;
-            for (int i = 0; i < FT_SIZE; ++i)
-                a.values[i] += ft.weights[idx * FT_SIZE + i];
-        }
-        a.computed = true;
+
+    void add_piece(Accumulator& acc, Square king_sq, Color piece_color, Square piece_sq, PieceType pt, int delta) {
+        int idx = feature_index(acc.king_color, king_sq, piece_color, piece_sq, pt);
+        if (idx == -1) return;
+        int8_t* w = &ft.weights[idx * FT_SIZE];
+        for (int i = 0; i < FT_SIZE; ++i) acc.values[i] += delta * w[i] * FT_SCALE;
     }
-    std::vector<int16_t> activate(const std::vector<int16_t>& v) const {
-        std::vector<int16_t> out(FT_SIZE);
-        for (int i = 0; i < FT_SIZE; ++i) {
-            int16_t x = v[i];
-            out[i] = std::max(0, std::min(127, (int)x));
+
+    void recompute_accumulator(Accumulator& acc, const Position& pos, Color perspective_king_color) {
+        Square king_sq = pos.king_square(perspective_king_color);
+        acc.king_sq = king_sq;
+        acc.king_color = perspective_king_color;
+        acc.values.assign(FT_SIZE, 0);
+        for (int i = 0; i < FT_SIZE; ++i) acc.values[i] = ft.bias[i];
+        for (Color c : {WHITE, BLACK}) {
+            for (PieceType pt = PAWN; pt <= QUEEN; ++pt) {
+                U64 bb = pos.bb(c, pt);
+                while (bb) {
+                    Square sq = pop_lsb(bb);
+                    int idx = feature_index(perspective_king_color, king_sq, c, sq, pt);
+                    if (idx != -1) {
+                        int8_t* w = &ft.weights[idx * FT_SIZE];
+                        for (int i = 0; i < FT_SIZE; ++i) acc.values[i] += w[i] * FT_SCALE;
+                    }
+                }
+            }
         }
-        return out;
+        acc.computed = true;
     }
-    int16_t forward(const std::vector<int16_t>& input) const {
-        std::vector<int16_t> l1_out(L1_SIZE, 0);
-        for (int i = 0; i < L1_SIZE; ++i) {
-            int32_t sum = l1.bias[i];
-            for (int j = 0; j < FT_SIZE; ++j)
-                sum += input[j] * l1.weights[j * L1_SIZE + i];
-            l1_out[i] = std::max(0, std::min(127, (int)sum));
-        }
-        std::vector<int16_t> l2_out(L2_SIZE, 0);
-        for (int i = 0; i < L2_SIZE; ++i) {
-            int32_t sum = l2.bias[i];
-            for (int j = 0; j < L1_SIZE; ++j)
-                sum += l1_out[j] * l2.weights[j * L2_SIZE + i];
-            l2_out[i] = std::max(0, std::min(127, (int)sum));
-        }
-        int32_t out = output_bias;
-        for (int i = 0; i < L2_SIZE; ++i)
-            out += l2_out[i] * output.weights[i];
-        return out;
+
+    std::pair<Square, Square> get_castling_rook_squares(Color us, Square king_from, Square king_to) {
+        int step = (king_to > king_from) ? 1 : -1;
+        Square rook_from = (step == 1) ? (us == WHITE ? make_square(7,0) : make_square(7,7))
+                                       : (us == WHITE ? make_square(0,0) : make_square(0,7));
+        Square rook_to = king_from + step;
+        return {rook_from, rook_to};
     }
+
 public:
     NNUEEvaluator() {
-        ft.weights.resize(INPUT_SIZE * FT_SIZE, 0);
+        ft.weights.resize(FT_INPUTS * FT_SIZE, 0);
         ft.bias.resize(FT_SIZE, 0);
         l1.weights.resize(FT_SIZE * L1_SIZE, 0);
         l1.bias.resize(L1_SIZE, 0);
@@ -1310,53 +1329,143 @@ public:
         l2.bias.resize(L2_SIZE, 0);
         output.weights.resize(L2_SIZE, 0);
         output_bias = 0;
-        acc[0].computed = acc[1].computed = false;
     }
+
     bool load(const std::string& filename) {
         std::ifstream file(filename, std::ios::binary);
         if (!file) return false;
-        uint32_t magic, version, ft_dim, l1_dim, l2_dim, out_dim;
+        uint32_t magic, version, ft_inputs, ft_size, l1_size, l2_size, out_dim;
         file.read((char*)&magic, sizeof(magic));
         file.read((char*)&version, sizeof(version));
-        file.read((char*)&ft_dim, sizeof(ft_dim));
-        file.read((char*)&l1_dim, sizeof(l1_dim));
-        file.read((char*)&l2_dim, sizeof(l2_dim));
+        file.read((char*)&ft_inputs, sizeof(ft_inputs));
+        file.read((char*)&ft_size, sizeof(ft_size));
+        file.read((char*)&l1_size, sizeof(l1_size));
+        file.read((char*)&l2_size, sizeof(l2_size));
         file.read((char*)&out_dim, sizeof(out_dim));
-        if (magic != 0x5A5A5A5A || version != 1 || ft_dim != FT_SIZE || l1_dim != L1_SIZE || l2_dim != L2_SIZE || out_dim != 1)
+        if (magic != 0x5A5A5A5A || version != 2 || ft_inputs != FT_INPUTS || ft_size != FT_SIZE || l1_size != L1_SIZE || l2_size != L2_SIZE || out_dim != 1)
             return false;
         auto read_layer = [&](Layer& l, size_t cnt, size_t bias_size) {
             l.weights.resize(cnt);
             l.bias.resize(bias_size);
-            file.read((char*)l.weights.data(), l.weights.size() * sizeof(int16_t));
+            file.read((char*)l.weights.data(), l.weights.size() * sizeof(int8_t));
             file.read((char*)l.bias.data(), l.bias.size() * sizeof(int16_t));
         };
-        read_layer(ft, INPUT_SIZE * FT_SIZE, FT_SIZE);
+        read_layer(ft, FT_INPUTS * FT_SIZE, FT_SIZE);
         read_layer(l1, FT_SIZE * L1_SIZE, L1_SIZE);
         read_layer(l2, L1_SIZE * L2_SIZE, L2_SIZE);
         output.weights.resize(L2_SIZE);
-        file.read((char*)output.weights.data(), L2_SIZE * sizeof(int16_t));
+        file.read((char*)output.weights.data(), L2_SIZE * sizeof(int8_t));
         file.read((char*)&output_bias, sizeof(int16_t));
-        acc[0].computed = acc[1].computed = false;
         return true;
     }
+
+    void push() {
+        auto& s0 = tls.stack[0], &s1 = tls.stack[1];
+        if (s0.empty()) { s0.emplace_back(); s1.emplace_back(); }
+        else { s0.push_back(s0.back()); s1.push_back(s1.back()); }
+    }
+
+    void pop() { tls.stack[0].pop_back(); tls.stack[1].pop_back(); }
+
+    void make_move(const Position& pos, Move m, Color us, PieceType moving_pt, PieceType captured_pt,
+                   bool was_promotion, PieceType prom_pt = NO_PIECE) {
+        Color them = Color(us ^ 1);
+        Square from = from_sq(m), to = to_sq(m);
+        auto& acc0 = tls.stack[0].back();
+        auto& acc1 = tls.stack[1].back();
+        for (int p = 0; p < 2; ++p) {
+            auto& acc = (p == 0) ? acc0 : acc1;
+            Color pkc = (p == 0) ? WHITE : BLACK;
+            Square old_ksq = acc.king_sq;
+            Square new_ksq = pos.king_square(pkc);
+            if (new_ksq != old_ksq) {
+                recompute_accumulator(acc, pos, pkc);
+            } else {
+                add_piece(acc, old_ksq, us, from, moving_pt, -1);
+                if (is_en_passant(m)) {
+                    Square ep_cap = to + (us == WHITE ? -8 : 8);
+                    add_piece(acc, old_ksq, them, ep_cap, PAWN, -1);
+                } else if (captured_pt != NO_PIECE) {
+                    add_piece(acc, old_ksq, them, to, captured_pt, -1);
+                }
+                if (is_castling(m)) {
+                    auto [rf, rt] = get_castling_rook_squares(us, from, to);
+                    add_piece(acc, old_ksq, us, rf, ROOK, -1);
+                    add_piece(acc, old_ksq, us, rt, ROOK, +1);
+                }
+                PieceType final_pt = was_promotion ? prom_pt : moving_pt;
+                add_piece(acc, old_ksq, us, to, final_pt, +1);
+                acc.king_sq = old_ksq;
+                acc.computed = true;
+            }
+        }
+    }
+
     int evaluate(const Position& pos) {
-        if (!acc[0].computed) refresh_accumulator(pos, 0);
-        auto l0 = activate(acc[0].values);
-        int16_t out = forward(l0);
-        return out / 10;
+        auto& acc0 = tls.stack[0].back();
+        if (!acc0.computed) recompute_accumulator(acc0, pos, WHITE);
+        alignas(32) int16_t l0[FT_SIZE];
+        for (int i = 0; i < FT_SIZE; ++i) {
+            int16_t x = acc0.values[i];
+            l0[i] = std::max(0, std::min(127, (int)x));
+        }
+        alignas(32) int16_t l1_out[L1_SIZE] = {0};
+#ifdef USE_AVX2
+        for (int i = 0; i < L1_SIZE; ++i) {
+            __m256i sum = _mm256_setzero_si256();
+            for (int j = 0; j < FT_SIZE; j += 16) {
+                __m256i l0_vec = _mm256_load_si256((__m256i*)&l0[j]);
+                __m128i w8 = _mm_load_si128((__m128i*)&l1.weights[j * L1_SIZE + i]);
+                __m256i w16 = _mm256_cvtepi8_epi16(w8);
+                sum = _mm256_add_epi32(sum, _mm256_madd_epi16(l0_vec, w16));
+            }
+            __m128i s_high = _mm256_extracti128_si256(sum, 1);
+            __m128i s_low = _mm256_castsi256_si128(sum);
+            __m128i s128 = _mm_add_epi32(s_low, s_high);
+            s128 = _mm_add_epi32(s128, _mm_shuffle_epi32(s128, _MM_SHUFFLE(1,0,3,2)));
+            s128 = _mm_add_epi32(s128, _mm_shufflelo_epi16(s128, _MM_SHUFFLE(1,0,3,2)));
+            int32_t total = _mm_cvtsi128_si32(s128) + l1.bias[i];
+            total = (total * HIDDEN_SCALE) >> 8;
+            l1_out[i] = std::max(0, std::min(127, total));
+        }
+#else
+        for (int i = 0; i < L1_SIZE; ++i) {
+            int32_t sum = l1.bias[i];
+            for (int j = 0; j < FT_SIZE; ++j) sum += l0[j] * l1.weights[j * L1_SIZE + i];
+            sum = (sum * HIDDEN_SCALE) >> 8;
+            l1_out[i] = std::max(0, std::min(127, sum));
+        }
+#endif
+        alignas(32) int16_t l2_out[L2_SIZE] = {0};
+        for (int i = 0; i < L2_SIZE; ++i) {
+            int32_t sum = l2.bias[i];
+            for (int j = 0; j < L1_SIZE; ++j) sum += l1_out[j] * l2.weights[j * L2_SIZE + i];
+            sum = (sum * HIDDEN_SCALE) >> 8;
+            l2_out[i] = std::max(0, std::min(127, sum));
+        }
+        int32_t out = output_bias;
+        for (int i = 0; i < L2_SIZE; ++i) out += l2_out[i] * output.weights[i];
+        out = (out * HIDDEN_SCALE) >> 8;
+        Value score = out / 16;
+        return (pos.side_to_move() == WHITE) ? score : -score;
     }
 };
+
+thread_local NNUEEvaluator::ThreadData NNUEEvaluator::tls;
 #endif
 
-// ============================================================================
-// Classical evaluation
-// ============================================================================
+// ----------------------------------------------------------------------------
+// Classical evaluation (with all advanced terms)
+// ----------------------------------------------------------------------------
 class Evaluation {
 private:
 #ifdef USE_NNUE
     NNUEEvaluator nnue;
     float nnue_weight;
 #endif
+    int contempt;
+
+public:
     bool is_passed_pawn(const Position& pos, Square sq, Color c) const {
         int f = file_of(sq), r = rank_of(sq);
         for (int df = -1; df <= 1; ++df) {
@@ -1366,12 +1475,13 @@ private:
             int end   = (c == WHITE) ? 7 : r-1;
             for (int nr = start; nr <= end; ++nr) {
                 Square s = make_square(nf, nr);
-                if (pos.piece_on(s) && ((pos.piece_on(s) & 7) == PAWN) && ((pos.piece_on(s) >> 3) != c))
-                    return false;
+                int pc = pos.piece_on(s);
+                if (pc && (pc & 7) == PAWN && (pc >> 3) != c) return false;
             }
         }
         return true;
     }
+
     int mobility_bonus(PieceType pt, int cnt) const {
         static const int bonus[][7] = {
             {0,0,0,0,0,0,0},{0,5,10,15,20,25,30},{0,10,20,30,40,50,60},
@@ -1379,18 +1489,27 @@ private:
         };
         return bonus[pt][std::min(cnt,6)];
     }
+
     int outpost_bonus(const Position& pos, Square sq, Color c) const {
         if (!(Bitboards::pawn_attacks[c][sq] & pos.bb(c,PAWN))) return 0;
-        if (Bitboards::pawn_attacks[1-c][sq] & pos.bb(Color(1-c),PAWN)) return 0;
+        bool safe = !(Bitboards::pawn_attacks[1-c][sq] & pos.bb(Color(1-c),PAWN));
         int r = rank_of(sq);
-        if (c == WHITE && r >= 4) return 30;
-        if (c == BLACK && r <= 3) return 30;
-        return 0;
+        int base = 20;
+        int rank_bonus = (c == WHITE) ? std::max(0, r-4)*5 : std::max(0, 3-r)*5;
+        int safety = safe ? 10 : 0;
+        int king_dist = 0;
+        Square ksq = pos.bb(Color(1-c), KING) ? lsb(pos.bb(Color(1-c), KING)) : NO_SQUARE;
+        if (ksq != NO_SQUARE) {
+            int kf = file_of(ksq), kr = rank_of(ksq);
+            if (std::max(std::abs(kf - file_of(sq)), std::abs(kr - r)) <= 2) king_dist = 5;
+        }
+        return base + rank_bonus + safety + king_dist;
     }
+
     int king_safety(const Position& pos, Color c) const {
-        Square ksq = pos.bb(c,KING) ? lsb(pos.bb(c,KING)) : NO_SQUARE;
-        if (ksq == NO_SQUARE) return 0;
-        int kf = file_of(ksq), kr = rank_of(ksq), shield = 0;
+        if (!pos.bb(c, KING)) return 0;  // king captured — shouldn't happen in legal play
+        Square ksq = pos.king_square(c);
+        int kf = file_of(ksq), kr = rank_of(ksq), safety = 0;
         for (int df = -1; df <= 1; ++df) {
             int f = kf + df;
             if (f < 0 || f > 7) continue;
@@ -1398,31 +1517,46 @@ private:
                 int r = (c == WHITE) ? kr + dr : kr - dr;
                 if (r < 0 || r > 7) continue;
                 Square s = make_square(f, r);
-                if (pos.piece_on(s) && ((pos.piece_on(s) & 7) == PAWN) && ((pos.piece_on(s) >> 3) == c))
-                    shield += 15;
+                int pc = pos.piece_on(s);
+                if (pc && (pc & 7) == PAWN && (pc >> 3) == c) safety += 20 - dr*5;
             }
         }
         U64 enemy_pawns = pos.bb(Color(1-c), PAWN);
         while (enemy_pawns) {
-            Square sq = pop_lsb(enemy_pawns);
-            if (abs(file_of(sq) - kf) <= 1 && abs(rank_of(sq) - kr) <= 3)
-                shield -= 5;
+            Square s = pop_lsb(enemy_pawns);
+            int sf = file_of(s), sr = rank_of(s);
+            if (std::abs(sf - kf) <= 1 && std::abs(sr - kr) <= 3) safety -= (4 - std::abs(sr - kr)) * 5;
         }
-        return shield;
+        for (int df = -1; df <= 1; ++df) {
+            int f = kf + df;
+            if (f < 0 || f > 7) continue;
+            U64 file_mask = 0x0101010101010101ULL << f;
+            if (!(pos.bb(c, PAWN) & file_mask)) safety -= 15;
+        }
+        return safety;
     }
+
     int space_bonus(const Position& pos, Color c) const {
-        int space = 0;
-        U64 pawns = pos.bb(c,PAWN);
-        while (pawns) {
-            Square sq = pop_lsb(pawns);
-            int f = file_of(sq), r = rank_of(sq);
-            if (f >= 2 && f <= 5) {
-                if (c == WHITE && r >= 4) space += (r - 3);
-                if (c == BLACK && r <= 3) space += (4 - r);
-            }
+        U64 half = (c == WHITE) ? 0xFFFFFFFF00000000ULL : 0x00000000FFFFFFFFULL;
+        U64 occ = pos.occupied_bb();
+        U64 enemy_pawns = pos.bb(Color(1-c), PAWN);
+        U64 enemy_pawn_att = 0;
+        U64 tmp = enemy_pawns;
+        while (tmp) { Square s = pop_lsb(tmp); enemy_pawn_att |= Bitboards::pawn_attacks[1-c][s]; }
+        U64 our_pieces = pos.bb(c, KNIGHT) | pos.bb(c, BISHOP) | pos.bb(c, ROOK) | pos.bb(c, QUEEN);
+        U64 our_att = 0;
+        tmp = our_pieces;
+        while (tmp) {
+            Square s = pop_lsb(tmp);
+            int pt = pos.piece_on(s) & 7;
+            if (pt == KNIGHT) our_att |= Bitboards::knight_attacks[s];
+            else if (pt == BISHOP) our_att |= bishop_attacks_magic(s, occ);
+            else if (pt == ROOK) our_att |= rook_attacks_magic(s, occ);
+            else if (pt == QUEEN) our_att |= queen_attacks_magic(s, occ);
         }
-        return space * 5;
+        return popcount(our_att & half & ~enemy_pawn_att) * 10;
     }
+
     int imbalance(const Position& pos) const {
         int wm = popcount(pos.bb(WHITE,KNIGHT)) + popcount(pos.bb(WHITE,BISHOP));
         int bm = popcount(pos.bb(BLACK,KNIGHT)) + popcount(pos.bb(BLACK,BISHOP));
@@ -1430,15 +1564,103 @@ private:
         int wq = popcount(pos.bb(WHITE,QUEEN)), bq = popcount(pos.bb(BLACK,QUEEN));
         return (wm - bm) * 15 + (wr - br) * 20 + (wq - bq) * 40;
     }
+
+    int threats(const Position& pos) const {
+        int score = 0;
+        U64 occ = pos.occupied_bb();
+
+        U64 white_attacks = 0, black_attacks = 0;
+        U64 white_pawn_attacks = 0, black_pawn_attacks = 0;
+        U64 white_minor_attacks = 0, black_minor_attacks = 0;
+        U64 white_rook_attacks = 0, black_rook_attacks = 0;
+        U64 white_queen_attacks = 0, black_queen_attacks = 0;
+
+        U64 wpawns = pos.bb(WHITE, PAWN);
+        U64 bpawns = pos.bb(BLACK, PAWN);
+        while (wpawns) { Square s = pop_lsb(wpawns); white_pawn_attacks |= Bitboards::pawn_attacks[WHITE][s]; }
+        while (bpawns) { Square s = pop_lsb(bpawns); black_pawn_attacks |= Bitboards::pawn_attacks[BLACK][s]; }
+
+        U64 wknights = pos.bb(WHITE, KNIGHT);
+        U64 bknights = pos.bb(BLACK, KNIGHT);
+        while (wknights) { Square s = pop_lsb(wknights); white_minor_attacks |= Bitboards::knight_attacks[s]; }
+        while (bknights) { Square s = pop_lsb(bknights); black_minor_attacks |= Bitboards::knight_attacks[s]; }
+
+        U64 wbishops = pos.bb(WHITE, BISHOP);
+        U64 bbishops = pos.bb(BLACK, BISHOP);
+        while (wbishops) { Square s = pop_lsb(wbishops); white_minor_attacks |= bishop_attacks_magic(s, occ); }
+        while (bbishops) { Square s = pop_lsb(bbishops); black_minor_attacks |= bishop_attacks_magic(s, occ); }
+
+        U64 wrooks = pos.bb(WHITE, ROOK);
+        U64 brooks = pos.bb(BLACK, ROOK);
+        while (wrooks) { Square s = pop_lsb(wrooks); white_rook_attacks |= rook_attacks_magic(s, occ); }
+        while (brooks) { Square s = pop_lsb(brooks); black_rook_attacks |= rook_attacks_magic(s, occ); }
+
+        U64 wqueens = pos.bb(WHITE, QUEEN);
+        U64 bqueens = pos.bb(BLACK, QUEEN);
+        while (wqueens) { Square s = pop_lsb(wqueens); white_queen_attacks |= queen_attacks_magic(s, occ); }
+        while (bqueens) { Square s = pop_lsb(bqueens); black_queen_attacks |= queen_attacks_magic(s, occ); }
+
+        white_attacks = white_pawn_attacks | white_minor_attacks | white_rook_attacks | white_queen_attacks;
+        black_attacks = black_pawn_attacks | black_minor_attacks | black_rook_attacks | black_queen_attacks;
+
+        U64 white_pieces = pos.bb(WHITE, KNIGHT) | pos.bb(WHITE, BISHOP) | pos.bb(WHITE, ROOK) | pos.bb(WHITE, QUEEN);
+        U64 black_pieces = pos.bb(BLACK, KNIGHT) | pos.bb(BLACK, BISHOP) | pos.bb(BLACK, ROOK) | pos.bb(BLACK, QUEEN);
+
+        U64 white_attacked_by_pawns = white_pieces & black_pawn_attacks;
+        U64 black_attacked_by_pawns = black_pieces & white_pawn_attacks;
+        while (white_attacked_by_pawns) { Square s = pop_lsb(white_attacked_by_pawns); int pt = pos.piece_on(s) & 7; score -= PIECE_VALUES[pt] / 2; }
+        while (black_attacked_by_pawns) { Square s = pop_lsb(black_attacked_by_pawns); int pt = pos.piece_on(s) & 7; score += PIECE_VALUES[pt] / 2; }
+
+        U64 white_attacked_by_minors = white_pieces & black_minor_attacks;
+        U64 black_attacked_by_minors = black_pieces & white_minor_attacks;
+        while (white_attacked_by_minors) { Square s = pop_lsb(white_attacked_by_minors); int pt = pos.piece_on(s) & 7; score -= PIECE_VALUES[pt] / 4; }
+        while (black_attacked_by_minors) { Square s = pop_lsb(black_attacked_by_minors); int pt = pos.piece_on(s) & 7; score += PIECE_VALUES[pt] / 4; }
+
+        U64 undefended_white = white_pieces & ~white_attacks;
+        U64 undefended_black = black_pieces & ~black_attacks;
+        U64 white_threats = black_attacks & undefended_white;
+        U64 black_threats = white_attacks & undefended_black;
+        score += popcount(white_threats) * 10;
+        score -= popcount(black_threats) * 10;
+
+        if ((pos.bb(WHITE, QUEEN) & black_attacks) != 0) score -= 50;
+        if ((pos.bb(BLACK, QUEEN) & white_attacks) != 0) score += 50;
+
+        U64 wrooks2 = pos.bb(WHITE, ROOK);
+        while (wrooks2) {
+            Square s = pop_lsb(wrooks2);
+            int f = file_of(s);
+            U64 file_mask = 0x0101010101010101ULL << f;
+            if (!(pos.bb(WHITE, PAWN) & file_mask)) {
+                if (!(pos.bb(BLACK, PAWN) & file_mask)) score += 15; else score += 10;
+            }
+        }
+        U64 brooks2 = pos.bb(BLACK, ROOK);
+        while (brooks2) {
+            Square s = pop_lsb(brooks2);
+            int f = file_of(s);
+            U64 file_mask = 0x0101010101010101ULL << f;
+            if (!(pos.bb(BLACK, PAWN) & file_mask)) {
+                if (!(pos.bb(WHITE, PAWN) & file_mask)) score -= 15; else score -= 10;
+            }
+        }
+
+        int phase = pos.game_phase();
+        return score * phase / TOTAL_PHASE;
+    }
+
 public:
-    Evaluation() {
+    Evaluation() : contempt(0) {
 #ifdef USE_NNUE
         nnue_weight = 0.8f;
 #endif
     }
+    void set_contempt(int c) { contempt = c; }
 #ifdef USE_NNUE
-    void set_nnue(const std::string& filename) { nnue.load(filename); }
+    void set_nnue(const std::string& file) { nnue.load(file); }
+    NNUEEvaluator& get_nnue() { return nnue; }
 #endif
+
     Value evaluate(const Position& pos) {
         if (pos.halfmove_clock() >= 100 || pos.is_repetition(2)) return 0;
         int pieces = popcount(pos.occupied_bb());
@@ -1454,27 +1676,24 @@ public:
         Value score = 0;
         for (int c = 0; c < 2; ++c) {
             for (int pt = PAWN; pt <= KING; ++pt) {
-                U64 pieces_bb = pos.bb(Color(c), PieceType(pt));
-                while (pieces_bb) {
-                    Square sq = pop_lsb(pieces_bb);
+                U64 bb = pos.bb(Color(c), PieceType(pt));
+                while (bb) {
+                    Square sq = pop_lsb(bb);
                     int idx = (c == WHITE) ? sq : 63 - sq;
                     int mg = 0, eg = 0;
-                    switch (pt) {
-                        case PAWN:   mg = PST_PAWN[idx]; eg = PST_PAWN[idx]; break;
-                        case KNIGHT: mg = PST_KNIGHT[idx]; eg = PST_KNIGHT[idx]; break;
-                        case BISHOP: mg = PST_BISHOP[idx]; eg = PST_BISHOP[idx]; break;
-                        case ROOK:   mg = PST_ROOK[idx]; eg = PST_ROOK[idx]; break;
-                        case QUEEN:  mg = PST_QUEEN[idx]; eg = PST_QUEEN[idx]; break;
-                        case KING:   mg = PST_KING_MG[idx]; eg = PST_KING_EG[idx]; break;
-                        default: break;
-                    }
+                    if (pt == PAWN) { mg = PST_PAWN[idx]; eg = PST_PAWN[idx]; }
+                    else if (pt == KNIGHT) { mg = PST_KNIGHT[idx]; eg = PST_KNIGHT[idx]; }
+                    else if (pt == BISHOP) { mg = PST_BISHOP[idx]; eg = PST_BISHOP[idx]; }
+                    else if (pt == ROOK) { mg = PST_ROOK[idx]; eg = PST_ROOK[idx]; }
+                    else if (pt == QUEEN) { mg = PST_QUEEN[idx]; eg = PST_QUEEN[idx]; }
+                    else if (pt == KING) { mg = PST_KING_MG[idx]; eg = PST_KING_EG[idx]; }
                     int pst = (mg * mg_w + eg * eg_w) / TOTAL_PHASE;
                     if (c == WHITE) score += pst + PIECE_VALUES[pt];
                     else score -= pst + PIECE_VALUES[pt];
                 }
             }
         }
-        int mob_white = 0, mob_black = 0;
+        int mob_w = 0, mob_b = 0;
         for (int pt = KNIGHT; pt <= QUEEN; ++pt) {
             U64 w = pos.bb(WHITE, PieceType(pt));
             while (w) {
@@ -1485,7 +1704,7 @@ public:
                 else if (pt == ROOK) attacks = rook_attacks_magic(from, pos.occupied_bb());
                 else attacks = queen_attacks_magic(from, pos.occupied_bb());
                 attacks &= ~pos.occupied_bb();
-                mob_white += mobility_bonus(PieceType(pt), popcount(attacks));
+                mob_w += mobility_bonus(PieceType(pt), popcount(attacks));
             }
             U64 b = pos.bb(BLACK, PieceType(pt));
             while (b) {
@@ -1496,30 +1715,50 @@ public:
                 else if (pt == ROOK) attacks = rook_attacks_magic(from, pos.occupied_bb());
                 else attacks = queen_attacks_magic(from, pos.occupied_bb());
                 attacks &= ~pos.occupied_bb();
-                mob_black += mobility_bonus(PieceType(pt), popcount(attacks));
+                mob_b += mobility_bonus(PieceType(pt), popcount(attacks));
             }
         }
-        score += (mob_white - mob_black);
+        score += (mob_w - mob_b);
+
         for (int c = 0; c < 2; ++c) {
             U64 pawns = pos.bb(Color(c), PAWN);
             for (int f = 0; f < 8; ++f) {
                 int cnt = popcount(pawns & (0x0101010101010101ULL << f));
-                if (cnt > 1) {
-                    int penalty = (cnt - 1) * 20;
-                    if (c == WHITE) score -= penalty; else score += penalty;
-                }
+                if (cnt > 1) { int p = (cnt-1)*20; if (c == WHITE) score -= p; else score += p; }
             }
             U64 tmp = pawns;
             while (tmp) {
                 Square sq = pop_lsb(tmp);
                 int f = file_of(sq);
-                bool isolated = true;
-                if ((f > 0 && (pawns & (0x0101010101010101ULL << (f-1)))) ||
-                    (f < 7 && (pawns & (0x0101010101010101ULL << (f+1)))))
-                    isolated = false;
-                if (isolated) {
-                    if (c == WHITE) score -= 15; else score += 15;
+                bool iso = true;
+                if ((f>0 && (pawns & (0x0101010101010101ULL << (f-1)))) ||
+                    (f<7 && (pawns & (0x0101010101010101ULL << (f+1))))) iso = false;
+                if (iso) { if (c == WHITE) score -= 15; else score += 15; }
+            }
+            tmp = pawns;
+            while (tmp) {
+                Square sq = pop_lsb(tmp);
+                int r = rank_of(sq);
+                if (c == WHITE && r < 6) {
+                    Square ahead = make_square(file_of(sq), r+1);
+                    if (!pos.piece_on(ahead) && (Bitboards::pawn_attacks[1-c][ahead] & pos.bb(Color(1-c),PAWN)))
+                        { if (c == WHITE) score -= 20; else score += 20; }
+                } else if (c == BLACK && r > 1) {
+                    Square ahead = make_square(file_of(sq), r-1);
+                    if (!pos.piece_on(ahead) && (Bitboards::pawn_attacks[1-c][ahead] & pos.bb(Color(1-c),PAWN)))
+                        { if (c == WHITE) score -= 20; else score += 20; }
                 }
+            }
+            tmp = pawns;
+            while (tmp) {
+                Square sq = pop_lsb(tmp);
+                if (Bitboards::pawn_attacks[c][sq] & pawns) {
+                    if (c == WHITE) score += 10; else score -= 10;
+                }
+            }
+            for (int f = 0; f < 8; ++f) {
+                int cnt = popcount(pawns & (0x0101010101010101ULL << f));
+                if (cnt >= 2) { if (c == WHITE) score += 15; else score -= 15; }
             }
             tmp = pawns;
             while (tmp) {
@@ -1528,11 +1767,12 @@ public:
                     int r = rank_of(sq);
                     int adv = (c == WHITE) ? r : 7 - r;
                     int bonus = 30 + adv * adv * 4;
+                    if (file_of(sq) == 0 || file_of(sq) == 7) bonus += 15;
+                    if ((c == WHITE && r == 6) || (c == BLACK && r == 1)) bonus += 30;
                     Square ksq = pos.bb(Color(1-c), KING) ? lsb(pos.bb(Color(1-c), KING)) : NO_SQUARE;
                     if (ksq != NO_SQUARE) {
                         int kf = file_of(ksq), kr = rank_of(ksq);
-                        int dist = std::max(std::abs(kf - file_of(sq)), std::abs(kr - r));
-                        if (dist < 3) bonus += 10;
+                        if (std::max(std::abs(kf - file_of(sq)), std::abs(kr - r)) < 3) bonus += 10;
                     }
                     if (c == WHITE) score += bonus; else score -= bonus;
                 }
@@ -1542,14 +1782,50 @@ public:
             U64 knights = pos.bb(Color(c), KNIGHT);
             while (knights) {
                 Square sq = pop_lsb(knights);
-                int bonus = outpost_bonus(pos, sq, Color(c));
-                if (c == WHITE) score += bonus; else score -= bonus;
+                int b = outpost_bonus(pos, sq, Color(c));
+                if (c == WHITE) score += b; else score -= b;
             }
             U64 bishops = pos.bb(Color(c), BISHOP);
             while (bishops) {
                 Square sq = pop_lsb(bishops);
-                int bonus = outpost_bonus(pos, sq, Color(c));
-                if (c == WHITE) score += bonus; else score -= bonus;
+                int b = outpost_bonus(pos, sq, Color(c));
+                if (c == WHITE) score += b; else score -= b;
+            }
+        }
+        for (int c = 0; c < 2; ++c) {
+            U64 knights = pos.bb(Color(c), KNIGHT);
+            while (knights) {
+                Square sq = pop_lsb(knights);
+                if (file_of(sq) == 0 || file_of(sq) == 7) {
+                    int p = 20 * phase / TOTAL_PHASE;
+                    if (c == WHITE) score -= p; else score += p;
+                }
+            }
+        }
+        for (int c = 0; c < 2; ++c) {
+            U64 bishops = pos.bb(Color(c), BISHOP);
+            while (bishops) {
+                Square sq = pop_lsb(bishops);
+                int f = file_of(sq), r = rank_of(sq);
+                if (f == r || f + r == 7) {
+                    U64 diag = bishop_attacks_magic(sq, 0);
+                    U64 pawns = pos.bb(WHITE,PAWN) | pos.bb(BLACK,PAWN);
+                    int blockers = popcount(bishop_attacks_magic(sq, pawns) & pawns);
+                    int b = (20 - 5 * blockers) * phase / TOTAL_PHASE;
+                    if (b > 0) { if (c == WHITE) score += b; else score -= b; }
+                }
+            }
+        }
+        for (int c = 0; c < 2; ++c) {
+            U64 queens = pos.bb(Color(c), QUEEN);
+            while (queens) {
+                Square sq = pop_lsb(queens);
+                int file = file_of(sq);
+                U64 file_mask = 0x0101010101010101ULL << file;
+                if (!((pos.bb(WHITE,PAWN)|pos.bb(BLACK,PAWN)) & file_mask)) {
+                    int b = 10 * phase / TOTAL_PHASE;
+                    if (c == WHITE) score += b; else score -= b;
+                }
             }
         }
         if (popcount(pos.bb(WHITE,BISHOP)) >= 2) score += 50;
@@ -1558,22 +1834,77 @@ public:
         score += popcount(pos.bb(WHITE,ROOK) & seventh) * 30;
         score -= popcount(pos.bb(BLACK,ROOK) & seventh) * 30;
         if (!pos.is_endgame()) score += king_safety(pos, WHITE) - king_safety(pos, BLACK);
-        score += space_bonus(pos, WHITE) - space_bonus(pos, BLACK);
+        int space = space_bonus(pos, WHITE) - space_bonus(pos, BLACK);
+        score += (space * phase) / TOTAL_PHASE;
         score += imbalance(pos);
+
+        // Weak/strong squares
+        U64 w_att = 0, b_att = 0;
+        U64 knights = pos.bb(WHITE,KNIGHT);
+        while (knights) { Square s = pop_lsb(knights); w_att |= Bitboards::knight_attacks[s]; }
+        knights = pos.bb(BLACK,KNIGHT);
+        while (knights) { Square s = pop_lsb(knights); b_att |= Bitboards::knight_attacks[s]; }
+        U64 bq = pos.bb(WHITE,BISHOP) | pos.bb(WHITE,QUEEN);
+        while (bq) { Square s = pop_lsb(bq); w_att |= bishop_attacks_magic(s, pos.occupied_bb()); }
+        bq = pos.bb(BLACK,BISHOP) | pos.bb(BLACK,QUEEN);
+        while (bq) { Square s = pop_lsb(bq); b_att |= bishop_attacks_magic(s, pos.occupied_bb()); }
+        U64 rooks = pos.bb(WHITE,ROOK);
+        while (rooks) { Square s = pop_lsb(rooks); w_att |= rook_attacks_magic(s, pos.occupied_bb()); }
+        rooks = pos.bb(BLACK,ROOK);
+        while (rooks) { Square s = pop_lsb(rooks); b_att |= rook_attacks_magic(s, pos.occupied_bb()); }
+        w_att |= pos.bb(WHITE, KING) ? Bitboards::king_attacks[pos.king_square(WHITE)] : 0ULL;
+        b_att |= pos.bb(BLACK, KING) ? Bitboards::king_attacks[pos.king_square(BLACK)] : 0ULL;
+        U64 empty = ~pos.occupied_bb();
+        U64 weak_w = b_att & ~w_att & empty;
+        U64 weak_b = w_att & ~b_att & empty;
+        U64 strong_w = w_att & ~b_att & empty;
+        U64 strong_b = b_att & ~w_att & empty;
+        U64 central = (1ULL<<make_square(3,3)) | (1ULL<<make_square(4,3)) | (1ULL<<make_square(3,4)) | (1ULL<<make_square(4,4));
+        int ws = popcount(weak_w & central)*20 + popcount(weak_w & ~central)*5
+                - (popcount(weak_b & central)*20 + popcount(weak_b & ~central)*5);
+        int ss = popcount(strong_w & central)*15 + popcount(strong_w & ~central)*3
+                - (popcount(strong_b & central)*15 + popcount(strong_b & ~central)*3);
+        score += (ws + ss) * phase / TOTAL_PHASE;
+
+        // Initiative
+        if (!pos.is_endgame()) {
+            int our = popcount(pos.bb(WHITE,KNIGHT)|pos.bb(WHITE,BISHOP)|pos.bb(WHITE,ROOK)|pos.bb(WHITE,QUEEN));
+            int their = popcount(pos.bb(BLACK,KNIGHT)|pos.bb(BLACK,BISHOP)|pos.bb(BLACK,ROOK)|pos.bb(BLACK,QUEEN));
+            if (std::abs(our - their) <= 1) {
+                int ks_w = king_safety(pos, WHITE);
+                int ks_b = king_safety(pos, BLACK);
+                int ks_diff = (pos.side_to_move() == WHITE) ? (ks_w - ks_b) : (ks_b - ks_w);
+                if (ks_diff > 0) score += ks_diff / 2;
+            }
+        }
+
+        // Trapped bishop
+        U64 wpawns = pos.bb(WHITE,PAWN), bpawns = pos.bb(BLACK,PAWN);
+        if ((pos.bb(WHITE,BISHOP) & (1ULL<<make_square(0,1))) && (wpawns & (1ULL<<make_square(1,2)))) score -= 50 * phase / TOTAL_PHASE;
+        if ((pos.bb(WHITE,BISHOP) & (1ULL<<make_square(7,1))) && (wpawns & (1ULL<<make_square(6,2)))) score -= 50 * phase / TOTAL_PHASE;
+        if ((pos.bb(BLACK,BISHOP) & (1ULL<<make_square(0,6))) && (bpawns & (1ULL<<make_square(1,5)))) score += 50 * phase / TOTAL_PHASE;
+        if ((pos.bb(BLACK,BISHOP) & (1ULL<<make_square(7,6))) && (bpawns & (1ULL<<make_square(6,5)))) score += 50 * phase / TOTAL_PHASE;
+
+        // Threat detection
+        score += threats(pos);
+
+        // Contempt (dynamic)
+        int dyn_contempt = (contempt * (24 - phase)) / 24;
+        if (dyn_contempt != 0 && !pos.is_endgame() && std::abs(score) < 200) score += dyn_contempt;
+
 #ifdef USE_NNUE
         if (nnue_weight > 0) {
             int nn = nnue.evaluate(pos);
-            if (pos.side_to_move() == BLACK) nn = -nn;
-            score = Value(nnue_weight * nn + (1.0 - nnue_weight) * score);
+            return Value(nnue_weight * nn + (1.0 - nnue_weight) * score);
         }
 #endif
         return (pos.side_to_move() == WHITE) ? score : -score;
     }
 };
 
-// ============================================================================
-// Transposition Table
-// ============================================================================
+// ----------------------------------------------------------------------------
+// Transposition Table (with DTZ)
+// ----------------------------------------------------------------------------
 struct TTEntry {
     U64 key;
     Depth depth;
@@ -1581,6 +1912,7 @@ struct TTEntry {
     Bound bound;
     Move move;
     int age;
+    int dtz;           // DTZ value (0 = unknown, positive = winning distance, negative = losing)
 };
 
 class TranspositionTable {
@@ -1607,50 +1939,36 @@ public:
         age = 0;
     }
     void new_search() { age++; }
-    void store(U64 key, Depth depth, Value score, Bound bound, Move move) {
+    void store(U64 key, Depth depth, Value score, Bound bound, Move move, int dtz = 0) {
         std::unique_lock lock(mtx);
         size_t idx = key % size;
         TTEntry& e = table[idx];
         if (e.key == key && e.depth > depth) return;
-        e = {key, depth, score, bound, move, age};
+        e = {key, depth, score, bound, move, age, dtz};
     }
-    bool probe(U64 key, Depth depth, Value alpha, Value beta, Value& score, Move& move) {
+    bool probe(U64 key, Depth depth, Value alpha, Value beta, Value& score, Move& move, int& dtz) {
         std::shared_lock lock(mtx);
         size_t idx = key % size;
         TTEntry& e = table[idx];
         if (e.key != key) return false;
         move = e.move;
+        dtz  = e.dtz;
+        // Always expose the stored score (even on depth-miss) so the caller can
+        // use it for singular extension heuristics. The caller decides whether
+        // to trust it based on the return value.
+        score = e.score;
         if (e.depth >= depth) {
-            if (e.bound == BOUND_EXACT) {
-                score = e.score;
-#ifdef DEBUG
-                fprintf(stderr, "DBG_TT_HIT key=%llx depth=%d entry_depth=%d bound=EXACT score=%d move=%d\n",
-                        (unsigned long long)key, depth, e.depth, e.score, e.move);
-#endif
-                return true;
-            }
-            if (e.bound == BOUND_LOWER && e.score >= beta) {
-#ifdef DEBUG
-                fprintf(stderr, "DBG_TT_CUTOFF LOWER key=%llx depth=%d entry_depth=%d score=%d move=%d\n",
-                        (unsigned long long)key, depth, e.depth, e.score, e.move);
-#endif
-                score = e.score; return true;
-            }
-            if (e.bound == BOUND_UPPER && e.score <= alpha) {
-#ifdef DEBUG
-                fprintf(stderr, "DBG_TT_CUTOFF UPPER key=%llx depth=%d entry_depth=%d score=%d move=%d\n",
-                        (unsigned long long)key, depth, e.depth, e.score, e.move);
-#endif
-                score = e.score; return true;
-            }
+            if (e.bound == BOUND_EXACT) { return true; }
+            if (e.bound == BOUND_LOWER && e.score >= beta)  { return true; }
+            if (e.bound == BOUND_UPPER && e.score <= alpha) { return true; }
         }
         return false;
     }
 };
 
-// ============================================================================
-// Opening Book
-// ============================================================================
+// ----------------------------------------------------------------------------
+// Opening Book (Polyglot)
+// ----------------------------------------------------------------------------
 class OpeningBook {
 private:
     struct Entry { uint64_t key; uint16_t move; uint16_t weight; uint32_t learn; };
@@ -1702,7 +2020,7 @@ public:
             double total = 0;
             std::vector<double> weights;
             for (auto& e : matches) {
-                double w = std::pow(e.weight, 1.0 + variety / 10.0);
+                double w = std::pow(e.weight, 1.0 + variety/10.0);
                 weights.push_back(w);
                 total += w;
             }
@@ -1719,9 +2037,9 @@ public:
     }
 };
 
-// ============================================================================
-// Syzygy Tablebase wrapper
-// ============================================================================
+// ----------------------------------------------------------------------------
+// Syzygy Tablebase wrapper (with full DTZ support)
+// ----------------------------------------------------------------------------
 class SyzygyTablebase {
 private:
     bool initialized;
@@ -1765,16 +2083,16 @@ public:
             for (int j = i+1; j < cnt; ++j)
                 if (pieces[j] < pieces[i]) { std::swap(pieces[i], pieces[j]); std::swap(squares[i], squares[j]); }
         return tb_probe_wdl(pieces, squares, cnt,
-            (pos.castling_rights() & 1) ? 1 : 0,
-            (pos.castling_rights() & 2) ? 1 : 0,
-            (pos.castling_rights() & 4) ? 1 : 0,
-            (pos.castling_rights() & 8) ? 1 : 0,
+            (pos.castle_rook(WHITE,0) != -1) ? 1 : 0,
+            (pos.castle_rook(WHITE,1) != -1) ? 1 : 0,
+            (pos.castle_rook(BLACK,0) != -1) ? 1 : 0,
+            (pos.castle_rook(BLACK,1) != -1) ? 1 : 0,
             pos.ep_sq() != -1 ? file_of(pos.ep_sq()) : 0,
             pos.halfmove_clock(),
             (pos.side_to_move() == WHITE) ? 0 : 1);
     }
-    unsigned probe_root(Position& pos, std::vector<unsigned>& results) {
-        if (!can_probe(pos)) return 0;
+    int probe_dtz(const Position& pos, int& success) {
+        if (!can_probe(pos)) { success = 0; return 0; }
         unsigned pieces[32], squares[32];
         int cnt = 0;
         for (Square sq = 0; sq < 64; ++sq) {
@@ -1799,41 +2117,64 @@ public:
         for (int i = 0; i < cnt; ++i)
             for (int j = i+1; j < cnt; ++j)
                 if (pieces[j] < pieces[i]) { std::swap(pieces[i], pieces[j]); std::swap(squares[i], squares[j]); }
-        unsigned* res = tb_probe_root(pieces, squares, cnt,
-            (pos.castling_rights() & 1) ? 1 : 0,
-            (pos.castling_rights() & 2) ? 1 : 0,
-            (pos.castling_rights() & 4) ? 1 : 0,
-            (pos.castling_rights() & 8) ? 1 : 0,
+
+        unsigned res = tb_probe_root_dtz(pieces, squares, cnt,
+            (pos.castle_rook(WHITE,0) != -1) ? 1 : 0,
+            (pos.castle_rook(WHITE,1) != -1) ? 1 : 0,
+            (pos.castle_rook(BLACK,0) != -1) ? 1 : 0,
+            (pos.castle_rook(BLACK,1) != -1) ? 1 : 0,
             pos.ep_sq() != -1 ? file_of(pos.ep_sq()) : 0,
             pos.halfmove_clock(),
             (pos.side_to_move() == WHITE) ? 0 : 1,
-            nullptr);
-        if (!res) return 0;
-        results.clear();
-        for (int i = 0; i < TB_MAX_MOVES && res[i] != 0; ++i) results.push_back(res[i]);
-        return results.size();
+            &success);
+        return success ? (res & 0xFFFF) : 0;
     }
-    Value wdl_to_score(int wdl, int ply) {
-        switch (wdl) {
-            case TB_WIN: return MATE_SCORE - ply - 1;
-            case TB_LOSS: return -MATE_SCORE + ply + 1;
-            case TB_DRAW: return 0;
-            case TB_CURSED_WIN: return 1;
-            case TB_BLESSED_LOSS: return -1;
-            default: return 0;
+    Move probe_root_dtz_move(const Position& pos) {
+        if (!can_probe(pos)) return NO_MOVE;
+        unsigned pieces[32], squares[32];
+        int cnt = 0;
+        for (Square sq = 0; sq < 64; ++sq) {
+            int pc = pos.piece_on(sq);
+            if (pc == 0) continue;
+            Color c = Color(pc >> 3);
+            PieceType pt = PieceType(pc & 7);
+            int code;
+            switch (pt) {
+                case PAWN:   code = (c == WHITE) ? TB_PAWN : TB_PAWN | TB_SIDEMASK; break;
+                case KNIGHT: code = (c == WHITE) ? TB_KNIGHT : TB_KNIGHT | TB_SIDEMASK; break;
+                case BISHOP: code = (c == WHITE) ? TB_BISHOP : TB_BISHOP | TB_SIDEMASK; break;
+                case ROOK:   code = (c == WHITE) ? TB_ROOK : TB_ROOK | TB_SIDEMASK; break;
+                case QUEEN:  code = (c == WHITE) ? TB_QUEEN : TB_QUEEN | TB_SIDEMASK; break;
+                case KING:   code = (c == WHITE) ? TB_KING : TB_KING | TB_SIDEMASK; break;
+                default: continue;
+            }
+            pieces[cnt] = code;
+            squares[cnt] = sq;
+            cnt++;
         }
-    }
-    Move best_move_from_results(const Position& pos, const std::vector<unsigned>& results) {
-        if (results.empty()) return NO_MOVE;
-        unsigned res = results[0];
+        for (int i = 0; i < cnt; ++i)
+            for (int j = i+1; j < cnt; ++j)
+                if (pieces[j] < pieces[i]) { std::swap(pieces[i], pieces[j]); std::swap(squares[i], squares[j]); }
+
+        int success;
+        unsigned res = tb_probe_root_dtz(pieces, squares, cnt,
+            (pos.castle_rook(WHITE,0) != -1) ? 1 : 0,
+            (pos.castle_rook(WHITE,1) != -1) ? 1 : 0,
+            (pos.castle_rook(BLACK,0) != -1) ? 1 : 0,
+            (pos.castle_rook(BLACK,1) != -1) ? 1 : 0,
+            pos.ep_sq() != -1 ? file_of(pos.ep_sq()) : 0,
+            pos.halfmove_clock(),
+            (pos.side_to_move() == WHITE) ? 0 : 1,
+            &success);
+        if (!success) return NO_MOVE;
         unsigned pg_move = (res >> 8) & 0xFFFF;
         int f_from = pg_move & 7, r_from = (pg_move >> 3) & 7;
         int f_to = (pg_move >> 6) & 7, r_to = (pg_move >> 9) & 7;
         int prom = (pg_move >> 12) & 7;
         Square from = make_square(f_from, r_from), to = make_square(f_to, r_to);
         Move moves[256];
-        int cnt = generate_moves(pos, moves);
-        for (int i = 0; i < cnt; ++i) {
+        int cnt_moves = generate_moves(pos, moves);
+        for (int i = 0; i < cnt_moves; ++i) {
             Move m = moves[i];
             if (from_sq(m) != from || to_sq(m) != to) continue;
             PieceType m_prom = promotion_type(m);
@@ -1845,35 +2186,96 @@ public:
         }
         return NO_MOVE;
     }
+    Value wdl_to_score(int wdl, int ply) {
+        switch (wdl) {
+            case TB_WIN: return MATE_SCORE - ply - 1;
+            case TB_LOSS: return -MATE_SCORE + ply + 1;
+            case TB_DRAW: return 0;
+            case TB_CURSED_WIN: return 1;
+            case TB_BLESSED_LOSS: return -1;
+            default: return 0;
+        }
+    }
 };
 
-// ============================================================================
-// Time Manager
-// ============================================================================
+// ----------------------------------------------------------------------------
+// Persistent Learning Table
+// ----------------------------------------------------------------------------
+class LearningTable {
+private:
+    struct Entry { int32_t total_score; uint32_t count; };
+    std::array<Entry, LEARNING_TABLE_SIZE> table;
+    std::string filename;
+    mutable std::mutex mtx;
+    bool enabled;
+    int learning_rate;
+    int max_adjust;
+    U64 hash_to_index(U64 hash) const { return hash & (LEARNING_TABLE_SIZE - 1); }
+public:
+    LearningTable() : enabled(false), learning_rate(100), max_adjust(50) { clear(); }
+    void set_enabled(bool e) { enabled = e; }
+    void set_filename(const std::string& fname) { filename = fname; }
+    void set_learning_rate(int r) { learning_rate = r; }
+    void set_max_adjust(int m) { max_adjust = m; }
+    void clear() { std::lock_guard<std::mutex> lock(mtx); for (auto& e : table) e = {0,0}; }
+    bool load() {
+        if (filename.empty()) return false;
+        std::ifstream file(filename, std::ios::binary);
+        if (!file) return false;
+        std::lock_guard<std::mutex> lock(mtx);
+        file.read((char*)table.data(), sizeof(Entry) * LEARNING_TABLE_SIZE);
+        return !!file;
+    }
+    bool save() {
+        if (filename.empty() || !enabled) return false;
+        std::ofstream file(filename, std::ios::binary);
+        if (!file) return false;
+        std::lock_guard<std::mutex> lock(mtx);
+        file.write((char*)table.data(), sizeof(Entry) * LEARNING_TABLE_SIZE);
+        return !!file;
+    }
+    int16_t probe(U64 hash) const {
+        if (!enabled) return 0;
+        std::lock_guard<std::mutex> lock(mtx);
+        const auto& e = table[hash_to_index(hash)];
+        if (e.count == 0) return 0;
+        int32_t adj = (e.total_score * learning_rate) / e.count;
+        adj = std::clamp(adj, -max_adjust, max_adjust);
+        return int16_t(adj);
+    }
+    void update(U64 hash, int result, Color side_to_move) {
+        if (!enabled) return;
+        int side = (side_to_move == WHITE) ? 1 : -1;
+        int adjusted = result * side;
+        std::lock_guard<std::mutex> lock(mtx);
+        auto& e = table[hash_to_index(hash)];
+        e.total_score += adjusted;
+        e.count++;
+    }
+};
+
+// ----------------------------------------------------------------------------
+// Time Manager (smooth)
+// ----------------------------------------------------------------------------
 class TimeManager {
 private:
-    int64_t start_time;
-    int64_t time_left;
-    int64_t increment;
-    int moves_to_go;
-    int move_time;
-    bool infinite;
-    int move_overhead;
+    int64_t start_time, time_left, increment;
+    int moves_to_go, move_time, move_overhead;
+    bool infinite, pondering;
     int64_t soft_limit, hard_limit;
-    double best_move_stability;
     Value prev_score;
-    int score_drop_count;
-
+    int score_drop_count, best_move_stability_count, game_phase;
 public:
     TimeManager() : start_time(0), time_left(0), increment(0), moves_to_go(40),
-                    move_time(0), infinite(false), move_overhead(100),
-                    best_move_stability(1.0), prev_score(0), score_drop_count(0) {}
+                    move_time(0), move_overhead(100), infinite(false), pondering(false),
+                    soft_limit(0), hard_limit(0), prev_score(0), score_drop_count(0),
+                    best_move_stability_count(0), game_phase(0) {}
     void set_side(Color side, int64_t wtime, int64_t btime, int64_t winc, int64_t binc,
-                  int moves, int movetime, bool inf) {
+                  int moves, int movetime, bool inf, bool pond = false) {
         start_time = current_time();
-        infinite = inf;
+        infinite = inf; pondering = pond;
         if (movetime > 0) { move_time = movetime; soft_limit = hard_limit = move_time; return; }
-        if (infinite) { move_time = 0; soft_limit = hard_limit = INT64_MAX; return; }
+        if (infinite || pondering) { move_time = 0; soft_limit = hard_limit = INT64_MAX; return; }
         time_left = (side == WHITE) ? wtime : btime;
         increment = (side == WHITE) ? winc : binc;
         moves_to_go = (moves > 0) ? moves : 40;
@@ -1881,30 +2283,41 @@ public:
         soft_limit = base;
         hard_limit = std::min(time_left / 2, base * 5);
     }
-    int64_t current_time() const {
-        return std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
-    }
+    int64_t current_time() const { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
     int64_t elapsed() const { return current_time() - start_time; }
     void set_move_overhead(int ms) { move_overhead = ms; }
+    void set_game_phase(int phase) { game_phase = phase; }
+    void scale_time(double factor) {
+        factor = std::clamp(factor, 0.2, 1.5);
+        soft_limit = int64_t(soft_limit * factor);
+        hard_limit = int64_t(hard_limit * factor);
+    }
+    void update(Value current_score, bool best_move_changed) {
+        if (current_score < prev_score - 50) score_drop_count++; else score_drop_count = std::max(0, score_drop_count-1);
+        best_move_stability_count = best_move_changed ? 0 : best_move_stability_count + 1;
+        prev_score = current_score;
+    }
     bool time_for_depth(int depth) const {
-        if (infinite) return true;
-        int64_t elapsed_time = elapsed();
-        double time_factor = best_move_stability;
-        if (score_drop_count > 0) time_factor *= 1.5;
-        return elapsed_time < soft_limit * time_factor;
+        if (infinite || pondering) return true;
+        int64_t e = elapsed();
+        double factor = 1.0;
+        if (best_move_stability_count < 3) factor *= 1.5;
+        if (score_drop_count > 2) factor *= 1.3;
+        factor *= 1.0 + 0.5 * (1.0 - std::abs(game_phase - 12) / 12.0);
+        return e < soft_limit * factor;
     }
     bool stop_early() const {
-        if (infinite) return false;
+        if (infinite || pondering) return false;
         if (move_time > 0) return elapsed() + move_overhead >= move_time;
         return elapsed() + move_overhead >= hard_limit;
     }
 };
 
-// ============================================================================
-// Global search state
-// ============================================================================
+// ----------------------------------------------------------------------------
+// Global search state and data structures
+// ----------------------------------------------------------------------------
 std::atomic<bool> stop_search{false};
+std::atomic<bool> pondering{false};
 std::atomic<uint64_t> nodes{0};
 std::atomic<uint64_t> node_limit{0};
 std::atomic<uint64_t> tb_hits{0};
@@ -1912,6 +2325,49 @@ TimeManager tm;
 std::atomic<Move> shared_best_move{NO_MOVE};
 std::atomic<Value> shared_best_score{-INF};
 
+// Multi-PV structures
+struct RootMoveInfo {
+    Move move;
+    Value score;
+    std::vector<Move> pv;
+    bool operator<(const RootMoveInfo& other) const { return score > other.score; }
+};
+std::vector<RootMoveInfo> root_infos;
+std::mutex root_infos_mutex;
+std::atomic<int> depth_done_count{0};
+std::atomic<bool> depth_continue{false};
+std::atomic<int> depth_ack_count{0};
+
+// Forward declarations needed by SplitPoint
+class SearchThread;
+struct ScoredMove;
+
+// YBWC split point
+struct SplitPoint {
+    Position* pos;
+    SearchThread* master;
+    std::vector<ScoredMove> moves;
+    std::atomic<int> next_move;
+    int depth, ply;
+    Value alpha, beta;
+    bool cut;
+    std::mutex mtx;
+    std::condition_variable cv;
+    int workers;
+    bool finished;
+    Value best_score;
+    Move best_move;
+    std::vector<Move> pv;
+    SplitPoint() : pos(nullptr), master(nullptr), next_move(0), depth(0), ply(0),
+                   alpha(-INF), beta(INF), cut(false), workers(0), finished(false),
+                   best_score(-INF), best_move(NO_MOVE) {}
+};
+std::vector<SplitPoint*> active_splits;
+std::mutex splits_mutex;
+std::condition_variable splits_cv;
+std::atomic<bool> threads_idle{false};
+
+// Per‑ply stack
 struct Stack {
     Move killers[2];
     Move counter;
@@ -1919,17 +2375,31 @@ struct Stack {
     int static_eval;
     bool in_check;
     Move current_move;
+    int captured_piece;
     int excluded_move;
+    int current_piece_idx;
 };
 
+// Scored move for ordering
 struct ScoredMove {
     Move move;
     int score;
 };
 
+// Learning instance
+LearningTable learning;
+
 // ============================================================================
-// Search Thread
+// End of Part 2
 // ============================================================================
+// ============================================================================
+// Part 3 of 4: Hugine 2.0 – Search Thread (negamax, quiescence, YBWC)
+// ============================================================================
+
+// Forward declarations for YBWC helpers
+void help_search(SearchThread* thread);
+void help_at_split(SearchThread* thread, SplitPoint* sp);
+
 class SearchThread {
 private:
     Position& root_pos;
@@ -1939,23 +2409,67 @@ private:
     OpeningBook* book;
     std::vector<Stack> stack;
     int history[2][64][64];
+    int butterfly_history[12][64];
+    int correction_history[2][64][64];
+    int cont_history[12][64][12][64];
     int counter_moves[64][64];
     int follow_up_moves[64][64];
-    int threat_history[2][64][64];
+    int capture_history[12][6][64];   // [moving_piece_idx][captured_pt-1][to_sq]
     int thread_id;
+    int total_threads;
     int multi_pv;
     std::vector<Move> pv[MAX_PLY];
     Value prev_eval = 0;
+    Move prev_best_move = NO_MOVE;
 
-    int reduction(bool improving, Depth depth, int move_idx, int move_score) {
+public:
+    bool idle;
+    SplitPoint* current_split;
+    std::atomic<uint64_t> nodes;
+
+    SearchThread(int id, int total, Position& pos, TranspositionTable& t, SyzygyTablebase& tbb, Evaluation& e, OpeningBook* b)
+        : thread_id(id), total_threads(total), root_pos(pos), tt(t), tb(tbb), eval(e), book(b), idle(false), current_split(nullptr), nodes(0) {
+        memset(history, 0, sizeof(history));
+        memset(butterfly_history, 0, sizeof(butterfly_history));
+        memset(correction_history, 0, sizeof(correction_history));
+        memset(cont_history, 0, sizeof(cont_history));
+        memset(counter_moves, 0, sizeof(counter_moves));
+        memset(follow_up_moves, 0, sizeof(follow_up_moves));
+        memset(capture_history, 0, sizeof(capture_history));
+        multi_pv = 1;
+        stack.resize(MAX_PLY);
+        for (int i = 0; i < MAX_PLY; ++i) {
+            stack[i].killers[0] = stack[i].killers[1] = NO_MOVE;
+            stack[i].counter = NO_MOVE;
+            stack[i].ply = i;
+            stack[i].static_eval = 0;
+            stack[i].in_check = false;
+            stack[i].current_move = NO_MOVE;
+            stack[i].captured_piece = 0;
+            stack[i].excluded_move = -1;
+            stack[i].current_piece_idx = -1;
+        }
+    }
+
+    void set_multi_pv(int mpv) { multi_pv = mpv; }
+
+    // ------------------------------------------------------------------------
+    // Reduction helper
+    // ------------------------------------------------------------------------
+    int reduction(bool improving, Depth depth, int move_idx, int move_score, bool capture, bool check) {
         int r = LMR_BASE + (move_idx / LMR_DIV);
         if (depth < 3) r = 0;
         if (!improving) r += 1;
-        if (move_score < 200000) r += 1; // low history
-        return std::min(r, depth - 1);
+        if (capture) r -= 1;
+        if (check) r -= 1;
+        if (move_score < 200000) r += 1;
+        return std::max(0, std::min(r, depth - 2));
     }
 
-    int score_move(Move m, int ply, Move tt_move, const Position& pos) {
+    // ------------------------------------------------------------------------
+    // Move scoring
+    // ------------------------------------------------------------------------
+    int score_move(Move m, int ply, Move tt_move, const Position& pos, int idx, bool captured) {
         int s = 0;
         if (m == tt_move) s += 1000000;
         if (ply < MAX_PLY) {
@@ -1971,20 +2485,54 @@ private:
             if (m == follow_up_moves[from_sq(last2)][to_sq(last2)]) s += 600000;
         }
         Color us = pos.side_to_move();
-        s += history[us][from_sq(m)][to_sq(m)];
-        s += threat_history[us][from_sq(m)][to_sq(m)];
-        if (pos.piece_on(to_sq(m))) {
-            int victim = pos.piece_on(to_sq(m)) & 7;
-            int attacker = pos.piece_on(from_sq(m)) & 7;
-            s += 500000 + PIECE_VALUES[victim] - PIECE_VALUES[attacker];
+        Square from = from_sq(m), to = to_sq(m);
+        int moving_pc = pos.piece_on(from);
+        int pt = moving_pc & 7;
+        int piece_idx = us * 6 + (pt - 1);
+        s += history[us][from][to];
+        s += butterfly_history[piece_idx][to] / 4;
+        s += correction_history[us][from][to] / 8;
+        if (ply > 0) {
+            int prev_piece_idx = stack[ply-1].current_piece_idx;
+            if (prev_piece_idx != -1) {
+                Square prev_to = to_sq(stack[ply-1].current_move);
+                s += cont_history[prev_piece_idx][prev_to][piece_idx][to] / 8;
+            }
+        }
+        if (pos.piece_on(to)) {
+            int cap_pt = (pos.piece_on(to) & 7) - 1;  // 0-indexed captured piece type
+            if (cap_pt >= 0 && cap_pt < 6)
+                s += capture_history[piece_idx][cap_pt][to] / 4;
+            int see_val = pos.see(m);
+            s += 500000 + see_val * 100;
         }
         if (pos.gives_check(m)) s += 400000;
+
+        // DTZ bonus for early moves or captures
+        if (ply < 5 && (idx < 3 || captured)) {
+            Position child = pos;
+            child.make_move(m);
+            U64 child_key = child.get_hash();
+            Value dummy_score;
+            Move dummy_move;
+            int child_dtz = 0;
+            if (tt.probe(child_key, 0, -INF, INF, dummy_score, dummy_move, child_dtz) && child_dtz != 0) {
+                if (child_dtz > 0) s += 5000 - child_dtz * 100;
+                else s += 3000 + child_dtz * 100;
+            }
+        }
         return s;
     }
 
-    void update_history(Move move, int depth, bool good, const Position& pos) {
+    // ------------------------------------------------------------------------
+    // History updates
+    // ------------------------------------------------------------------------
+    void update_history(Move move, int depth, bool good, bool captured, const Position& pos) {
         Square from = from_sq(move), to = to_sq(move);
         Color us = pos.side_to_move();
+        int moving_pc = pos.piece_on(from);
+        int pt = moving_pc & 7;
+        int piece_idx = us * 6 + (pt - 1);
         int delta = depth * depth;
         if (good) {
             history[us][from][to] += delta - history[us][from][to] * abs(delta) / MAX_HISTORY;
@@ -1992,85 +2540,224 @@ private:
             history[us][from][to] -= delta + history[us][from][to] * abs(delta) / MAX_HISTORY;
         }
         history[us][from][to] = std::max(-MAX_HISTORY, std::min(MAX_HISTORY, history[us][from][to]));
+
+        if (captured) {
+            // Update capture history: indexed by moving piece, captured piece type, target square
+            int cap_pc = pos.piece_on(to);
+            if (cap_pc) {
+                int cap_pt = (cap_pc & 7) - 1;  // 0-indexed
+                if (cap_pt >= 0 && cap_pt < 6) {
+                    if (good) {
+                        capture_history[piece_idx][cap_pt][to] += delta - capture_history[piece_idx][cap_pt][to] * abs(delta) / MAX_HISTORY;
+                    } else {
+                        capture_history[piece_idx][cap_pt][to] -= delta + capture_history[piece_idx][cap_pt][to] * abs(delta) / MAX_HISTORY;
+                    }
+                    capture_history[piece_idx][cap_pt][to] = std::max(-MAX_HISTORY, std::min(MAX_HISTORY, capture_history[piece_idx][cap_pt][to]));
+                }
+            }
+        } else {
+            if (good) {
+                butterfly_history[piece_idx][to] += delta - butterfly_history[piece_idx][to] * abs(delta) / MAX_HISTORY;
+            } else {
+                butterfly_history[piece_idx][to] -= delta + butterfly_history[piece_idx][to] * abs(delta) / MAX_HISTORY;
+            }
+            butterfly_history[piece_idx][to] = std::max(-MAX_HISTORY, std::min(MAX_HISTORY, butterfly_history[piece_idx][to]));
+        }
     }
 
-    Value quiescence(Position& pos, Value alpha, Value beta, int ply) {
-        if (ply >= MAX_PLY) return eval.evaluate(pos);
-        if (nodes.load() % 1024 == 0 && tm.stop_early()) { stop_search = true; return 0; }
+    void update_correction(Move move, int depth, bool good, Color us) {
+        Square from = from_sq(move), to = to_sq(move);
+        int delta = depth * depth;
+        if (good) {
+            correction_history[us][from][to] += delta - correction_history[us][from][to] * abs(delta) / MAX_HISTORY;
+        } else {
+            correction_history[us][from][to] -= delta + correction_history[us][from][to] * abs(delta) / MAX_HISTORY;
+        }
+        correction_history[us][from][to] = std::max(-MAX_HISTORY, std::min(MAX_HISTORY, correction_history[us][from][to]));
+    }
+
+    void update_continuation(Move move, int depth, bool good, const Position& pos, int ply) {
+        if (ply <= 0) return;
+        Square from = from_sq(move), to = to_sq(move);
+        Color us = pos.side_to_move();
+        int moving_pc = pos.piece_on(from);
+        int pt = moving_pc & 7;
+        int cur_piece_idx = us * 6 + (pt - 1);
+        int prev_piece_idx = stack[ply-1].current_piece_idx;
+        if (prev_piece_idx == -1) return;
+        Square prev_to = to_sq(stack[ply-1].current_move);
+        int delta = depth * depth;
+        if (good) {
+            cont_history[prev_piece_idx][prev_to][cur_piece_idx][to] += delta - cont_history[prev_piece_idx][prev_to][cur_piece_idx][to] * abs(delta) / MAX_HISTORY;
+        } else {
+            cont_history[prev_piece_idx][prev_to][cur_piece_idx][to] -= delta + cont_history[prev_piece_idx][prev_to][cur_piece_idx][to] * abs(delta) / MAX_HISTORY;
+        }
+        int& val = cont_history[prev_piece_idx][prev_to][cur_piece_idx][to];
+        val = std::max(-MAX_HISTORY, std::min(MAX_HISTORY, val));
+    }
+
+    // ------------------------------------------------------------------------
+    // Quiescence search
+    // ------------------------------------------------------------------------
+    Value quiescence(Position& pos, Value alpha, Value beta, int ply, int q_depth = 0) {
+        if (ply >= MAX_PLY || q_depth >= MAX_QSEARCH_DEPTH)
+            return eval.evaluate(pos) + learning.probe(pos.get_hash());
+        nodes++;
+        if (nodes.load() % 256 == 0) {
+            if (stop_search) return 0;
+            if (tm.stop_early()) { stop_search = true; return 0; }
+        }
         if (node_limit > 0 && nodes >= node_limit) { stop_search = true; return 0; }
         if (pos.is_repetition(2)) return 0;
         if (tb.can_probe(pos)) {
-            int wdl = tb.probe_wdl(pos);
-            if (wdl != TB_RESULT_FAILED) { tb_hits++; return tb.wdl_to_score(wdl, ply); }
+            int dtz_success;
+            int dtz = tb.probe_dtz(pos, dtz_success);
+            if (dtz_success) {
+                int sign = (dtz > 0) ? 1 : -1;
+                int dist = std::abs(dtz);
+                return (sign == 1) ? MATE_SCORE - dist - ply : -MATE_SCORE + dist + ply;
+            }
         }
-        Value stand_pat = eval.evaluate(pos);
-        if (stand_pat >= beta) return beta;
-        if (stand_pat > alpha) alpha = stand_pat;
+
+        bool in_check = pos.is_check();
+
+        // Stand-pat: only valid when NOT in check. When in check the side to
+        // move MUST play — there is no "do nothing" option, so stand_pat is
+        // meaningless and using it would produce inflated scores.
+        Value stand_pat = eval.evaluate(pos) + learning.probe(pos.get_hash());
+        if (!in_check) {
+            if (stand_pat >= beta) return beta;
+            if (stand_pat > alpha) alpha = stand_pat;
+        }
+
         Move moves[256];
-        int cnt = generate_moves(pos, moves, true);
+        // When in check: generate ALL moves (evasions). Only captures are
+        // generated otherwise — the standard quiescence contract.
+        int cnt = in_check ? generate_moves(pos, moves, false)
+                           : generate_moves(pos, moves, true);
+
+        // Sort: captures by SEE descending; when in check sort all by rough priority
         std::sort(moves, moves + cnt, [&](Move a, Move b) {
-            int av = 0, bv = 0;
-            if (pos.piece_on(to_sq(a))) av = PIECE_VALUES[pos.piece_on(to_sq(a)) & 7];
-            if (pos.piece_on(to_sq(b))) bv = PIECE_VALUES[pos.piece_on(to_sq(b)) & 7];
-            return av > bv;
+            return pos.see(a) > pos.see(b);
         });
+
+        int legal_count = 0;
         for (int i = 0; i < cnt; ++i) {
             Move m = moves[i];
-            // Skip if move would capture the opponent's king
-            if (pos.piece_on(to_sq(m)) && ((pos.piece_on(to_sq(m)) & 7) == KING))
-                continue;
-            int victim_val = pos.piece_on(to_sq(m)) ? PIECE_VALUES[pos.piece_on(to_sq(m)) & 7] : 0;
-            if (victim_val + 200 + stand_pat < alpha) continue;
+            if (pos.piece_on(to_sq(m)) && ((pos.piece_on(to_sq(m)) & 7) == KING)) continue;
+
+            // Delta / SEE pruning — skip bad captures when NOT in check
+            if (!in_check) {
+                int see_val = pos.see(m);
+                if (see_val + 200 + stand_pat < alpha) continue;
+            }
+
             int captured = pos.piece_on(to_sq(m));
+            int moving_pc = pos.piece_on(from_sq(m));
+            PieceType moving_pt = PieceType(moving_pc & 7);
+            Color us = pos.side_to_move();
+            bool was_promotion = promotion_type(m) != NO_PIECE;
+            PieceType prom_pt = promotion_type(m);
             int old_castle = pos.castling_rights(), old_ep = pos.ep_sq(), old_fifty = pos.halfmove_clock();
-            // --- FIX: set current_move before making the move ---
-            stack[ply].current_move = m;
+
+#ifdef USE_NNUE
+            eval.get_nnue().push();
+#endif
             pos.make_move(m);
-            if (pos.mover_in_check()) { pos.undo_move(m, captured, old_castle, old_ep, old_fifty); continue; }
-            nodes++;
-            Value score = -quiescence(pos, -beta, -alpha, ply+1);
+            stack[ply].captured_piece = captured;
+            stack[ply].current_move = m;
+            if (was_promotion) moving_pt = prom_pt;
+            int cur_piece_idx = us * 6 + (moving_pt - 1);
+            stack[ply].current_piece_idx = cur_piece_idx;
+#ifdef USE_NNUE
+            eval.get_nnue().make_move(pos, m, us, moving_pt, PieceType(captured & 7), was_promotion, prom_pt);
+#endif
+
+            if (pos.mover_in_check()) {
+#ifdef USE_NNUE
+                eval.get_nnue().pop();
+#endif
+                pos.undo_move(m, captured, old_castle, old_ep, old_fifty);
+                continue;
+            }
+            legal_count++;
+            Value score = -quiescence(pos, -beta, -alpha, ply+1, q_depth+1);
+#ifdef USE_NNUE
+            eval.get_nnue().pop();
+#endif
             pos.undo_move(m, captured, old_castle, old_ep, old_fifty);
             if (score >= beta) return beta;
             if (score > alpha) alpha = score;
         }
+
+        // When in check with no legal moves: checkmate
+        if (in_check && legal_count == 0) return -MATE_SCORE + ply;
+
         return alpha;
     }
 
+    // ------------------------------------------------------------------------
+    // ProbCut
+    // ------------------------------------------------------------------------
     Value probcut(Position& pos, Depth depth, Value alpha, Value beta, int ply) {
         if (depth < PROBCUT_DEPTH) return -INF;
         Move moves[256];
         int cnt = generate_moves(pos, moves, true);
         Value best = -INF;
+        int margin = PROBCUT_MARGIN_BASE + PROBCUT_MARGIN_PER_DEPTH * depth;
         for (int i = 0; i < cnt; ++i) {
             Move m = moves[i];
-            // Skip if move would capture the opponent's king
-            if (pos.piece_on(to_sq(m)) && ((pos.piece_on(to_sq(m)) & 7) == KING))
-                continue;
+            if (pos.piece_on(to_sq(m)) && ((pos.piece_on(to_sq(m)) & 7) == KING)) continue;
             int captured = pos.piece_on(to_sq(m));
             if (!captured) continue;
             int victim = captured & 7;
             int attacker = pos.piece_on(from_sq(m)) & 7;
             Value gain = PIECE_VALUES[victim] - PIECE_VALUES[attacker];
-            if (gain + PROBCUT_MARGIN < alpha) continue;
+            if (gain + margin < alpha) continue;
+
+            int moving_pc = pos.piece_on(from_sq(m));
+            PieceType moving_pt = PieceType(moving_pc & 7);
+            Color us = pos.side_to_move();
+            bool was_promotion = promotion_type(m) != NO_PIECE;
+            PieceType prom_pt = promotion_type(m);
             int old_castle = pos.castling_rights(), old_ep = pos.ep_sq(), old_fifty = pos.halfmove_clock();
-            // --- FIX: set current_move before making the move ---
-            stack[ply].current_move = m;
+
+#ifdef USE_NNUE
+            eval.get_nnue().push();
+#endif
             pos.make_move(m);
+            stack[ply].captured_piece = captured;
+            stack[ply].current_move = m;
+            if (was_promotion) moving_pt = prom_pt;
+            int cur_piece_idx = us * 6 + (moving_pt - 1);
+            stack[ply].current_piece_idx = cur_piece_idx;
+#ifdef USE_NNUE
+            eval.get_nnue().make_move(pos, m, us, moving_pt, PieceType(captured & 7), was_promotion, prom_pt);
+#endif
+
             nodes++;
-            std::vector<Move> dummy_pv;
-            Value score = -negamax(pos, depth - 4, -alpha - PROBCUT_MARGIN, -alpha + PROBCUT_MARGIN, ply+1, true, dummy_pv);
+            std::vector<Move> dummy;
+            Value score = -negamax(pos, depth - 4, -alpha - margin, -alpha + margin, ply+1, true, dummy, NO_MOVE);
+#ifdef USE_NNUE
+            eval.get_nnue().pop();
+#endif
             pos.undo_move(m, captured, old_castle, old_ep, old_fifty);
             if (score > best) best = score;
             if (score >= beta) return score;
         }
-        // --- FIX: only return if >= beta, else -INF ---
         return (best >= beta) ? best : -INF;
     }
 
-    Value negamax(Position& pos, Depth depth, Value alpha, Value beta, int ply, bool cut, std::vector<Move>& pv_line) {
+    // ------------------------------------------------------------------------
+    // Negamax (core search)
+    // ------------------------------------------------------------------------
+    Value negamax(Position& pos, Depth depth, Value alpha, Value beta, int ply, bool cut, std::vector<Move>& pv_line, Move excluded = NO_MOVE) {
         pv_line.clear();
-        if (ply >= MAX_PLY) return eval.evaluate(pos);
-        if (nodes.load() % 1024 == 0 && tm.stop_early()) { stop_search = true; return 0; }
+        if (ply >= MAX_PLY) return eval.evaluate(pos) + learning.probe(pos.get_hash());
+        if (nodes.load() % 256 == 0) {
+            if (stop_search) return 0;
+            if (tm.stop_early()) { stop_search = true; return 0; }
+        }
         if (node_limit > 0 && nodes >= node_limit) { stop_search = true; return 0; }
         if (pos.is_repetition(2)) return 0;
         if (tb.can_probe(pos) && depth <= 0) {
@@ -2080,24 +2767,56 @@ private:
         alpha = std::max(alpha, -MATE_SCORE + ply);
         beta  = std::min(beta,  MATE_SCORE - ply - 1);
         if (alpha >= beta) return alpha;
+
         bool in_check = pos.is_check();
-        Value static_eval = eval.evaluate(pos);
+        Value static_eval = eval.evaluate(pos) + learning.probe(pos.get_hash());
         stack[ply].static_eval = static_eval;
         stack[ply].in_check = in_check;
         U64 key = pos.get_hash();
         Move tt_move = NO_MOVE;
-        Value tt_score;
-        if (tt.probe(key, depth, alpha, beta, tt_score, tt_move)) {
-            // --- FIX: decode mate score using ply ---
-            if (std::abs(tt_score) > MATE_OFFSET) {
-                int dist = (tt_score > 0) ? tt_score - MATE_OFFSET : -tt_score - MATE_OFFSET;
-                if (tt_score > 0)
-                    tt_score = MATE_SCORE - (ply + dist);
-                else
-                    tt_score = -(MATE_SCORE - (ply - dist));
+        Value tt_score = static_eval;  // safe fallback — never used raw without tt_hit guard
+        int tt_dtz = 0;
+        bool tt_hit = tt.probe(key, depth, alpha, beta, tt_score, tt_move, tt_dtz);
+
+        if (tt_hit) {
+            if (tt_dtz != 0) {
+                int sign = (tt_dtz > 0) ? 1 : -1;
+                int dist = std::abs(tt_dtz);
+                return (sign == 1) ? MATE_SCORE - dist - ply : -MATE_SCORE + dist + ply;
+            } else if (tt_score > MATE_OFFSET) {
+                // stored as (MATE_SCORE - dist_from_root) which is MATE_SCORE - (N - ply_at_store + ply_at_store)
+                // Standard: stored = score + ply_at_store, retrieve = stored - ply_current
+                tt_score -= ply;
+                if (tt_score > MATE_SCORE - 1) tt_score = MATE_SCORE - 1;
+            } else if (tt_score < -MATE_OFFSET) {
+                tt_score += ply;
+                if (tt_score < -MATE_SCORE + 1) tt_score = -MATE_SCORE + 1;
             }
             return tt_score;
         }
+
+        if (tb.can_probe(pos) && depth <= 3 && tt_dtz == 0 && !tt_hit) {
+            int dtz_success;
+            int dtz = tb.probe_dtz(pos, dtz_success);
+            if (dtz_success) tt.store(key, depth, 0, BOUND_NONE, NO_MOVE, dtz);
+        }
+
+        // DTZ pruning
+        if (tt_dtz != 0 && depth >= std::abs(tt_dtz) && tt_dtz > 0) {
+            return MATE_SCORE - tt_dtz - ply - 1;
+        }
+
+        // Singular extension — only when we have a real TT entry with a reliable score
+        // (tt_hit guarantees tt_score is set from a depth-sufficient, bounds-matching entry).
+        if (tt_hit && depth >= SINGULAR_EXTENSION_DEPTH && tt_move != NO_MOVE &&
+            excluded == NO_MOVE && !in_check && std::abs(tt_score) < MATE_SCORE - MAX_PLY) {
+            Value singular_beta = std::max(tt_score - SINGULAR_MARGIN, -INF);
+            Depth singular_depth = depth / 2;
+            std::vector<Move> dummy;
+            Value singular_score = -negamax(pos, singular_depth, -singular_beta, -singular_beta + 1, ply, false, dummy, tt_move);
+            if (singular_score <= singular_beta) depth++;
+        }
+
         if (depth <= 0) return quiescence(pos, alpha, beta, ply);
 
         // ProbCut
@@ -2106,113 +2825,228 @@ private:
             if (pc_score != -INF) return pc_score;
         }
 
-        // Null move pruning (adaptive reduction)
+        // Null move pruning
         if (!in_check && depth >= 2 && cut) {
             bool has_non_pawn = false;
             for (int pt = KNIGHT; pt <= QUEEN; ++pt)
                 if (pos.bb(pos.side_to_move(), PieceType(pt))) { has_non_pawn = true; break; }
             if (has_non_pawn) {
-                pos.make_move(NULL_MOVE);
-                int R = NULL_MOVE_R + depth / 6;
-                Value score = -negamax(pos, depth - R - 1, -beta, -beta+1, ply+1, false, pv_line);
-                pos.undo_null_move();
-                if (score >= beta) return beta;
+                bool only_kings_pawns = true;
+                for (int pt = KNIGHT; pt <= QUEEN; ++pt)
+                    if (pos.bb(WHITE, PieceType(pt)) || pos.bb(BLACK, PieceType(pt))) { only_kings_pawns = false; break; }
+                if (!only_kings_pawns) {
+#ifdef USE_NNUE
+                    eval.get_nnue().push();
+#endif
+                    pos.make_move(NULL_MOVE);
+                    int R = NULL_MOVE_R + depth / 6;
+                    Value score = -negamax(pos, depth - R - 1, -beta, -beta+1, ply+1, false, pv_line, NO_MOVE);
+#ifdef USE_NNUE
+                    eval.get_nnue().pop();
+#endif
+                    pos.undo_null_move();
+                    if (score >= beta) return beta;
+                }
             }
         }
+
         // Razoring
-        if (!in_check && depth <= 3 && alpha < static_eval - 400) {
-            Value rscore = quiescence(pos, alpha, beta, ply);
-            if (rscore <= alpha) return rscore;
+        if (!in_check && depth <= 6) {
+            int razor_margin;
+            if (depth <= 1) razor_margin = RAZOR_MARGIN_D1;
+            else if (depth == 2) razor_margin = RAZOR_MARGIN_D2;
+            else if (depth == 3) razor_margin = RAZOR_MARGIN_D3;
+            else razor_margin = RAZOR_MARGIN_D3 + 50 * (depth - 3);
+            if (static_eval + razor_margin < alpha) {
+                if (depth <= 3) {
+                    Value rscore = quiescence(pos, alpha, alpha+1, ply);
+                    if (rscore <= alpha) return rscore;
+                } else {
+                    std::vector<Move> dummy;
+                    Value rscore = -negamax(pos, depth - 4, -alpha-1, -alpha, ply, false, dummy, NO_MOVE);
+                    if (rscore <= alpha) return rscore;
+                }
+            }
         }
-        // Futility pruning
-        if (!in_check && depth <= 7 && static_eval - FUTILITY_MARGIN_FACTOR * depth >= beta)
-            return static_eval;
+
+        // Static null-move pruning
+        const int STATIC_NULL_MARGIN = 200;
+        if (!in_check && depth > 7 && static_eval - STATIC_NULL_MARGIN >= beta) return static_eval;
+
+        // Futility pruning (full node)
+        if (!in_check && depth <= 7 && static_eval - FUTILITY_MARGIN_FACTOR * depth >= beta) return static_eval;
+
         Move moves[256];
         int cnt = generate_moves(pos, moves);
         if (cnt == 0) return in_check ? -MATE_SCORE + ply : 0;
+
         std::vector<ScoredMove> scored;
         for (int i = 0; i < cnt; ++i) {
-            scored.push_back({moves[i], score_move(moves[i], ply, tt_move, pos)});
+            if (moves[i] == excluded) continue;
+            int captured = pos.piece_on(to_sq(moves[i])) != 0;
+            scored.push_back({moves[i], score_move(moves[i], ply, tt_move, pos, i, captured)});
         }
         std::sort(scored.begin(), scored.end(),
             [](const ScoredMove& a, const ScoredMove& b) { return a.score > b.score; });
+
+        // Multi-cut pruning
+        if (depth >= 6 && !in_check && cut && tt_move != NO_MOVE) {
+            int mc_count = 0;
+            for (int i = 0; i < std::min(3, (int)scored.size()); ++i) {
+                Move m = scored[i].move;
+                if (m == tt_move) continue;
+                if (pos.piece_on(to_sq(m)) && ((pos.piece_on(to_sq(m)) & 7) == KING)) continue;
+                int captured = pos.piece_on(to_sq(m));
+                int old_castle = pos.castling_rights(), old_ep = pos.ep_sq(), old_fifty = pos.halfmove_clock();
+                Position pos2 = pos;
+                pos2.make_move(m);
+                if (pos2.mover_in_check()) continue;
+                std::vector<Move> dummy;
+                Value score = -negamax(pos2, depth / 2, -beta, -beta+1, ply+1, false, dummy, NO_MOVE);
+                if (score >= beta && ++mc_count >= 2) return beta;
+            }
+        }
+
         if (tt_move == NO_MOVE && depth >= IID_DEPTH) {
             std::vector<Move> dummy;
-            negamax(pos, depth - IID_REDUCTION, alpha, beta, ply, false, dummy);
+            negamax(pos, depth - IID_REDUCTION, alpha, beta, ply, false, dummy, NO_MOVE);
         }
+
         Value best_score = -INF;
         Move best_move = NO_MOVE;
         Bound bound = BOUND_UPPER;
         bool improving = (ply >= 2 && static_eval > stack[ply-2].static_eval);
-        for (int i = 0; i < cnt; ++i) {
-            Move m = scored[i].move;
-            // Skip if move would capture the opponent's king
-            if (pos.piece_on(to_sq(m)) && ((pos.piece_on(to_sq(m)) & 7) == KING))
-                continue;
-            if (depth <= 3 && !in_check && !pos.piece_on(to_sq(m)) && pos.see(m) < SEE_QUIET_MARGIN) continue;
-            int captured = pos.piece_on(to_sq(m));
-            int old_castle = pos.castling_rights(), old_ep = pos.ep_sq(), old_fifty = pos.halfmove_clock();
-            // --- FIX: set current_move before making the move ---
-            stack[ply].current_move = m;
-            pos.make_move(m);
-            if (pos.mover_in_check()) { pos.undo_move(m, captured, old_castle, old_ep, old_fifty); continue; }
 
-#ifdef DEBUG
-            // --- DEBUG: per-move diagnostics ---
+        // YBWC split attempt
+        if (total_threads > 1 && depth >= 6 && scored.size() > 5 && !idle) {
+            SplitPoint* sp = new SplitPoint;
+            sp->pos = &pos;
+            sp->master = this;
+            sp->moves = scored;
+            sp->depth = depth;
+            sp->ply = ply;
+            sp->alpha = alpha;
+            sp->beta = beta;
+            sp->cut = cut;
+            sp->next_move = 0;
+            sp->workers = 0;
+            sp->finished = false;
+            sp->best_score = -INF;
+            sp->best_move = NO_MOVE;
             {
-                int f = from_sq(m), t = to_sq(m);
-                char ms[8];
-                sprintf(ms, "%c%d%c%d", 'a' + (f & 7), 1 + (f >> 3), 'a' + (t & 7), 1 + (t >> 3));
-                int cap = pos.piece_on(to_sq(m)) ? (pos.piece_on(to_sq(m)) & 7) : 0;
-                fprintf(stderr, "DBG_MOVE_ENTER ply=%d depth=%d move=%s cap=%d in_check_before=%d\n",
-                        ply, depth, ms, cap, in_check ? 1 : 0);
+                std::lock_guard<std::mutex> lock(splits_mutex);
+                active_splits.push_back(sp);
+                splits_cv.notify_all();
             }
+            help_at_split(this, sp);
+            {
+                std::unique_lock<std::mutex> lock(sp->mtx);
+                sp->cv.wait(lock, [sp]{ return sp->finished; });
+            }
+            {
+                std::lock_guard<std::mutex> lock(splits_mutex);
+                active_splits.erase(std::remove(active_splits.begin(), active_splits.end(), sp), active_splits.end());
+            }
+            pv_line = sp->pv;
+            best_score = sp->best_score;
+            best_move = sp->best_move;
+            delete sp;
+            if (best_score != -INF) {
+                if (best_score >= beta) bound = BOUND_LOWER;
+                else if (best_score > alpha) bound = BOUND_EXACT;
+                Value store = best_score;
+                if (store > MATE_SCORE - MAX_PLY) {
+                    store += ply; // push toward root
+                } else if (store < -MATE_SCORE + MAX_PLY) {
+                    store -= ply; // push toward root
+                }
+                tt.store(key, depth, store, bound, best_move);
+                return best_score;
+            }
+        }
+
+        // Normal move loop
+        for (size_t i = 0; i < scored.size(); ++i) {
+            Move m = scored[i].move;
+            if (pos.piece_on(to_sq(m)) && ((pos.piece_on(to_sq(m)) & 7) == KING)) continue;
+
+            // Futility pruning (per move)
+            if (depth <= 3 && !in_check && !pos.piece_on(to_sq(m))) {
+                int margin = SEE_QUIET_MARGIN + depth * 50;
+                if (scored[i].score < 500000) margin += 4 * depth;
+                if (static_eval + margin <= alpha) continue;
+            }
+
+            // Late move pruning
+            if (!pos.piece_on(to_sq(m)) && !in_check && depth <= 7 && i >= (size_t)(LMP_BASE + depth * LMP_FACTOR)) {
+                if (!improving) continue;
+                if (i >= (size_t)(LMP_BASE + depth * LMP_FACTOR * 2)) continue;
+            }
+
+            int captured = pos.piece_on(to_sq(m));
+            int moving_pc = pos.piece_on(from_sq(m));
+            PieceType moving_pt = PieceType(moving_pc & 7);
+            Color us = pos.side_to_move();
+            bool gives_check = pos.gives_check(m);
+            bool was_promotion = promotion_type(m) != NO_PIECE;
+            PieceType prom_pt = promotion_type(m);
+            int old_castle = pos.castling_rights(), old_ep = pos.ep_sq(), old_fifty = pos.halfmove_clock();
+
+#ifdef USE_NNUE
+            eval.get_nnue().push();
 #endif
+            pos.make_move(m);
+            stack[ply].captured_piece = captured;
+            stack[ply].current_move = m;
+            if (was_promotion) moving_pt = prom_pt;
+            int cur_piece_idx = us * 6 + (moving_pt - 1);
+            stack[ply].current_piece_idx = cur_piece_idx;
+#ifdef USE_NNUE
+            eval.get_nnue().make_move(pos, m, us, moving_pt, PieceType(captured & 7), was_promotion, prom_pt);
+#endif
+
+            if (pos.mover_in_check()) {
+#ifdef USE_NNUE
+                eval.get_nnue().pop();
+#endif
+                pos.undo_move(m, captured, old_castle, old_ep, old_fifty);
+                continue;
+            }
 
             nodes++;
             Depth new_depth = depth - 1;
             if (in_check) new_depth++;
+            int extension = 0;
+            if (ply > 0 && stack[ply-1].captured_piece != 0 && to_sq(m) == to_sq(stack[ply-1].current_move))
+                extension = 1;
+            else if (!extension && moving_pt == PAWN) {
+                if (eval.is_passed_pawn(pos, from_sq(m), us) &&
+                    ((us == WHITE && rank_of(to_sq(m)) > rank_of(from_sq(m))) ||
+                     (us == BLACK && rank_of(to_sq(m)) < rank_of(from_sq(m)))))
+                    extension = 1;
+            }
+            if (gives_check) extension++;
+            new_depth += extension;
+            new_depth = std::min(new_depth, depth + 2);
+
             std::vector<Move> child_pv;
             Value score;
             if (i == 0) {
-                score = -negamax(pos, new_depth, -beta, -alpha, ply+1, true, child_pv);
+                score = -negamax(pos, new_depth, -beta, -alpha, ply+1, true, child_pv, NO_MOVE);
             } else {
-                int red;
-                if (captured) {                     // no reduction for captures
-                    red = 0;
-                } else {
-                    red = reduction(improving, depth, i, scored[i].score);
-                }
-
-#ifdef DEBUG
-                // --- DEBUG: reduction decision ---
-                {
-                    int f = from_sq(m), t = to_sq(m);
-                    char ms[8];
-                    sprintf(ms, "%c%d%c%d", 'a' + (f & 7), 1 + (f >> 3), 'a' + (t & 7), 1 + (t >> 3));
-                    fprintf(stderr, "DBG_REDUCE ply=%d depth=%d move=%s captured=%d raw_score=%d red=%d new_depth=%d\n",
-                            ply, depth, ms, captured ? 1 : 0, scored[i].score, red, new_depth - red);
-                }
-#endif
-
-                score = -negamax(pos, new_depth - red, -alpha-1, -alpha, ply+1, true, child_pv);
+                int red = captured ? 0 : reduction(improving, depth, i, scored[i].score, captured != 0, gives_check);
+                score = -negamax(pos, new_depth - red, -alpha-1, -alpha, ply+1, true, child_pv, NO_MOVE);
                 if (score > alpha && score < beta)
-                    score = -negamax(pos, new_depth, -beta, -alpha, ply+1, true, child_pv);
+                    score = -negamax(pos, new_depth, -beta, -alpha, ply+1, true, child_pv, NO_MOVE);
             }
+
+#ifdef USE_NNUE
+            eval.get_nnue().pop();
+#endif
             pos.undo_move(m, captured, old_castle, old_ep, old_fifty);
 
-#ifdef DEBUG
-            // --- DEBUG: move result ---
-            {
-                int f = from_sq(m), t = to_sq(m);
-                char ms[8];
-                sprintf(ms, "%c%d%c%d", 'a' + (f & 7), 1 + (f >> 3), 'a' + (t & 7), 1 + (t >> 3));
-                fprintf(stderr, "DBG_MOVE_RESULT ply=%d depth=%d move=%s score=%d best_score=%d\n",
-                        ply, depth, ms, score, best_score);
-            }
-#endif
-
             if (stop_search) return 0;
+
             if (score > best_score) {
                 best_score = score;
                 best_move = m;
@@ -2223,15 +3057,22 @@ private:
                     bound = BOUND_EXACT;
                     if (score >= beta) {
                         bound = BOUND_LOWER;
+                        // Update history tables for the cutoff move and all moves searched before it
                         if (!captured) {
+                            // Quiet cutoff: update killer, quiet history, correction, continuation
                             if (stack[ply].killers[0] != m) {
                                 stack[ply].killers[1] = stack[ply].killers[0];
                                 stack[ply].killers[0] = m;
                             }
-                            update_history(m, depth, true, pos);
-                            for (int j = 0; j < i; ++j) {
-                                if (!pos.piece_on(to_sq(scored[j].move))) {
-                                    update_history(scored[j].move, depth, false, pos);
+                            update_history(m, depth, true, false, pos);
+                            update_correction(m, depth, true, us);
+                            update_continuation(m, depth, true, pos, ply);
+                            for (size_t j = 0; j < i; ++j) {
+                                bool is_cap = pos.piece_on(to_sq(scored[j].move)) != 0;
+                                if (!is_cap) {
+                                    update_history(scored[j].move, depth, false, false, pos);
+                                    update_correction(scored[j].move, depth, false, us);
+                                    update_continuation(scored[j].move, depth, false, pos, ply);
                                 }
                             }
                             if (ply > 0) {
@@ -2242,46 +3083,49 @@ private:
                                 Move last2 = stack[ply-2].current_move;
                                 follow_up_moves[from_sq(last2)][to_sq(last2)] = m;
                             }
+                        } else {
+                            // Capture cutoff: update capture history for the cutoff move
+                            // and penalise captures that failed to cut before it
+                            update_history(m, depth, true, true, pos);
+                            for (size_t j = 0; j < i; ++j) {
+                                bool is_cap = pos.piece_on(to_sq(scored[j].move)) != 0;
+                                if (is_cap)
+                                    update_history(scored[j].move, depth, false, true, pos);
+                            }
                         }
                         break;
                     }
                 }
             }
         }
-        // FIX: detect checkmate/stalemate when no legal move found
+
         if (best_score == -INF) {
             best_score = in_check ? -MATE_SCORE + ply : 0;
             bound = BOUND_EXACT;
             best_move = NO_MOVE;
         }
-        // --- FIX: store mate scores as distance + offset ---
+
         Value store_score = best_score;
-        if (std::abs(store_score) > MATE_SCORE - MAX_PLY) {
-            int dist = (store_score > 0) ? MATE_SCORE - store_score : store_score + MATE_SCORE;
-            store_score = (store_score > 0) ? MATE_OFFSET + dist : -(MATE_OFFSET + dist);
+        if (store_score > MATE_SCORE - MAX_PLY) {
+            store_score += ply;
+        } else if (store_score < -MATE_SCORE + MAX_PLY) {
+            store_score -= ply;
         }
         tt.store(key, depth, store_score, bound, best_move);
-        // --- FIX: atomic compare-exchange for shared best move ---
-        if (best_move != NO_MOVE) {
-            Value prev = shared_best_score.load(std::memory_order_relaxed);
-            while (best_score > prev && !shared_best_score.compare_exchange_weak(prev, best_score, std::memory_order_relaxed)) {
-                // prev updated automatically
-            }
-            if (best_score >= shared_best_score.load(std::memory_order_relaxed))
-                shared_best_move.store(best_move, std::memory_order_relaxed);
-        }
         return best_score;
     }
 
+    // ------------------------------------------------------------------------
+    // Output info (thread 0 only)
+    // ------------------------------------------------------------------------
     void output_info(int depth, Value score, const std::vector<Move>& pv) {
         int64_t elapsed = tm.elapsed();
         uint64_t nps = elapsed > 0 ? nodes * 1000 / elapsed : 0;
         std::string score_str;
-        // --- FIX: correct mate distance ---
         if (std::abs(score) > MATE_SCORE - 1000) {
             int mate_dist = (score > 0) ? (MATE_SCORE - score) : (MATE_SCORE + score);
             if (mate_dist < 0) mate_dist = 0;
-            score_str = (score > 0) ? ("mate " + std::to_string(mate_dist)) : ("mate -" + std::to_string(mate_dist));
+            score_str = (score > 0) ? "mate " + std::to_string(mate_dist) : "mate -" + std::to_string(mate_dist);
         } else {
             score_str = "cp " + std::to_string(score);
         }
@@ -2290,158 +3134,178 @@ private:
                   << " time " << elapsed << " tbhits " << tb_hits << " pv";
         Position tmp = root_pos;
         for (Move m : pv) {
-            std::cout << " " << char('a' + file_of(from_sq(m))) << char('1' + rank_of(from_sq(m)))
-                     << char('a' + file_of(to_sq(m))) << char('1' + rank_of(to_sq(m)));
+            // Validate that m is legal in the current position.
+            // TT hash collisions or stale PV entries can inject illegal moves;
+            // applying them corrupts the position and makes every subsequent
+            // move appear illegal in the GUI.
+            Move legal_moves[MAX_MOVES];
+            int legal_cnt = generate_moves(tmp, legal_moves);
+            bool found = false;
+            for (int li = 0; li < legal_cnt; ++li) {
+                if (legal_moves[li] == m) {
+                    // Final check: make the move and confirm the mover is not
+                    // left in check (pseudo-legal generator may include some).
+                    Position check_tmp = tmp;
+                    check_tmp.make_move(m);
+                    if (!check_tmp.mover_in_check()) { found = true; break; }
+                }
+            }
+            if (!found) break;  // Stop PV at first illegal move
+
+            // For Chess960, castling output is king-to-rook; otherwise king-to-destination.
+            Square mf = from_sq(m), mt = to_sq(m);
+            if (is_castling(m) && tmp.is_chess960()) {
+                Color us2 = tmp.piece_on(mf) != 0 ? Color(tmp.piece_on(mf) >> 3)
+                                                   : Color((mf < 32) ? WHITE : BLACK);
+                int si = (mt > mf) ? 0 : 1;
+                Square rsq = tmp.castle_rook(us2, si);
+                if (rsq != -1) mt = rsq;
+            }
+            std::cout << " " << char('a' + file_of(mf)) << char('1' + rank_of(mf))
+                      << char('a' + file_of(mt)) << char('1' + rank_of(mt));
+            PieceType prom = promotion_type(m);
+            if (prom != NO_PIECE) {
+                const char pc[] = " pnbrqk";
+                std::cout << pc[prom];
+            }
             tmp.make_move(m);
         }
         std::cout << std::endl;
     }
 
-#ifdef DEBUG
-    // DEBUG helper: returns score for single root move m searched to given depth
-    Value debug_search_one_move(const Position& root_pos, Move m, Depth depth) {
-        Position pos2 = root_pos;
-        pos2.make_move(m);
-        if (pos2.mover_in_check()) {
-            fprintf(stderr, "DBG_DEBUG_FORCE move illegal after make: move illegal\n");
-            return -INF;
-        }
-        std::vector<Move> pv;
-        Value v = -negamax(const_cast<Position&>(pos2), depth - 1, -INF, INF, 1, true, pv);
-        fprintf(stderr, "DBG_DEBUG_FORCE move=%d score=%d\n", m, v);
-        return v;
-    }
-#endif
-
-public:
-    SearchThread(int id, Position& pos, TranspositionTable& t, SyzygyTablebase& tbb, Evaluation& e, OpeningBook* b)
-        : thread_id(id), root_pos(pos), tt(t), tb(tbb), eval(e), book(b) {
-        memset(history, 0, sizeof(history));
-        memset(counter_moves, 0, sizeof(counter_moves));
-        memset(follow_up_moves, 0, sizeof(follow_up_moves));
-        memset(threat_history, 0, sizeof(threat_history));
-        multi_pv = 1;
-        // --- FIX: initialize stack entries ---
-        stack.resize(MAX_PLY);
-        for (int i = 0; i < MAX_PLY; ++i) {
-            stack[i].killers[0] = stack[i].killers[1] = NO_MOVE;
-            stack[i].counter = NO_MOVE;
-            stack[i].ply = i;
-            stack[i].static_eval = 0;
-            stack[i].in_check = false;
-            stack[i].current_move = NO_MOVE;
-            stack[i].excluded_move = -1;
-        }
-    }
-    void set_multi_pv(int mpv) { multi_pv = mpv; }
-    void search(int max_depth, uint64_t max_nodes) {
+    // ------------------------------------------------------------------------
+    // Main search entry (root)
+    // ------------------------------------------------------------------------
+    void search(int max_depth, uint64_t max_nodes, const std::vector<ScoredMove>& root_moves) {
         stop_search = false;
         nodes = 0;
         node_limit = max_nodes;
         tb_hits = 0;
         tt.new_search();
 
-        Move moves[MAX_MOVES];
-        int cnt = generate_moves(root_pos, moves);
-        if (cnt == 0) return;
-
-        // Filter out illegal root moves and king captures
-        std::vector<ScoredMove> root_moves;
-        for (int i = 0; i < cnt; ++i) {
-            Move m = moves[i];
-            // Skip if move would capture the opponent's king
-            if (root_pos.piece_on(to_sq(m)) && ((root_pos.piece_on(to_sq(m)) & 7) == KING))
-                continue;
-            int cap = root_pos.piece_on(to_sq(m));
-            int oc  = root_pos.castling_rights();
-            int oe  = root_pos.ep_sq();
-            int of_ = root_pos.halfmove_clock();
-            Position tmp = root_pos;
-            tmp.make_move(m);
-            if (!tmp.mover_in_check())
-                root_moves.push_back({m, 0});
+        std::vector<ScoredMove> local_root_moves = root_moves;
+        if (local_root_moves.empty()) {
+            Move moves[MAX_MOVES];
+            int cnt = generate_moves(root_pos, moves);
+            for (int i = 0; i < cnt; ++i) {
+                Move m = moves[i];
+                if (root_pos.piece_on(to_sq(m)) && ((root_pos.piece_on(to_sq(m)) & 7) == KING)) continue;
+                Position tmp = root_pos;
+                tmp.make_move(m);
+                if (!tmp.mover_in_check()) local_root_moves.push_back({m, 0});
+            }
         }
-        if (root_moves.empty()) return;
+        if (local_root_moves.empty()) return;
 
-        Move best_move = root_moves[0].move;
+#ifdef USE_NNUE
+        eval.get_nnue().evaluate(root_pos);
+#endif
+
+        Move best_move = local_root_moves[0].move;
         Value best_score = -INF;
+        prev_best_move = NO_MOVE;
+        idle = false;
 
         for (int depth = 1; depth <= max_depth && !stop_search; ++depth) {
             if (depth > 1 && !tm.time_for_depth(depth)) break;
 
-            // Re‑score root moves
-            for (auto& sm : root_moves)
-                sm.score = score_move(sm.move, 0, (best_move != NO_MOVE ? best_move : NO_MOVE), root_pos);
-            if (best_move != NO_MOVE) {
-                for (auto& sm : root_moves)
-                    if (sm.move == best_move) { sm.score = 10000000; break; }
+            for (auto& sm : local_root_moves) {
+                int captured = root_pos.piece_on(to_sq(sm.move)) != 0;
+                sm.score = score_move(sm.move, 0, (best_move != NO_MOVE ? best_move : NO_MOVE), root_pos, 0, captured);
             }
-            std::sort(root_moves.begin(), root_moves.end(),
+            if (best_move != NO_MOVE) {
+                for (auto& sm : local_root_moves)
+                    if (sm.move == best_move) sm.score = 10000000;
+            }
+            std::sort(local_root_moves.begin(), local_root_moves.end(),
                 [](const ScoredMove& a, const ScoredMove& b) { return a.score > b.score; });
 
-            // Aspiration windows
-            Value alpha_orig = (depth >= 5) ? (best_score - ASPIRATION_WINDOW) : -INF;
-            Value beta_orig  = (depth >= 5) ? (best_score + ASPIRATION_WINDOW) : INF;
-            Value alpha = alpha_orig, beta = beta_orig;
+            Value alpha = -INF, beta = INF;
+            if (depth >= 5) {
+                alpha = best_score - ASPIRATION_WINDOW;
+                beta  = best_score + ASPIRATION_WINDOW;
+            }
 
-            Move  depth_best  = NO_MOVE;
+            Move depth_best = NO_MOVE;
             Value depth_score = -INF;
-
+            std::vector<Move> depth_best_pv;  // best PV for this depth, reported once at completion
             bool need_retry = true;
+
             while (need_retry && !stop_search) {
-                need_retry  = false;
-                depth_best  = NO_MOVE;
+                need_retry = false;
+                depth_best = NO_MOVE;
                 depth_score = -INF;
                 Value window_alpha = alpha;
 
-                for (int i = 0; i < (int)root_moves.size() && !stop_search; ++i) {
-                    Move m = root_moves[i].move;
-                    // Skip if move would capture the opponent's king (redundant but safe)
-                    if (root_pos.piece_on(to_sq(m)) && ((root_pos.piece_on(to_sq(m)) & 7) == KING))
-                        continue;
-                    int cap = root_pos.piece_on(to_sq(m));
-                    int oc  = root_pos.castling_rights(), oe = root_pos.ep_sq(), of_ = root_pos.halfmove_clock();
-                    Position pos2 = root_pos;
-                    // --- FIX: set stack[0].current_move before calling negamax ---
-                    stack[0].current_move = m;
-                    pos2.make_move(m);
-                    if (pos2.mover_in_check()) continue;
+                for (size_t i = 0; i < local_root_moves.size() && !stop_search; ++i) {
+                    Move m = local_root_moves[i].move;
+                    if (root_pos.piece_on(to_sq(m)) && ((root_pos.piece_on(to_sq(m)) & 7) == KING)) continue;
 
-#ifdef DEBUG
-                    // --- DEBUG: root move instrumentation ---
-                    {
-                        int f = from_sq(m), t = to_sq(m);
-                        char ms[8];
-                        sprintf(ms, "%c%d%c%d", 'a' + (f & 7), 1 + (f >> 3), 'a' + (t & 7), 1 + (t >> 3));
-                        int cap_now = root_pos.piece_on(to_sq(m)) ? (root_pos.piece_on(to_sq(m)) & 7) : 0;
-                        fprintf(stderr, "DBG_ROOT_MOVE [%s] cap=%d mover_in_check_after_make=%d\n",
-                                ms, cap_now, pos2.mover_in_check() ? 1 : 0);
-                    }
+                    int cap = root_pos.piece_on(to_sq(m));
+                    int moving_pc = root_pos.piece_on(from_sq(m));
+                    PieceType moving_pt = PieceType(moving_pc & 7);
+                    Color us = root_pos.side_to_move();
+                    bool was_promotion = promotion_type(m) != NO_PIECE;
+                    PieceType prom_pt = promotion_type(m);
+                    int oc = root_pos.castling_rights(), oe = root_pos.ep_sq(), of_ = root_pos.halfmove_clock();
+                    Position pos2 = root_pos;
+
+#ifdef USE_NNUE
+                    eval.get_nnue().push();
 #endif
+                    pos2.make_move(m);
+                    stack[0].captured_piece = cap;
+                    stack[0].current_move = m;
+                    if (was_promotion) moving_pt = prom_pt;
+                    int cur_piece_idx = us * 6 + (moving_pt - 1);
+                    stack[0].current_piece_idx = cur_piece_idx;
+#ifdef USE_NNUE
+                    eval.get_nnue().make_move(pos2, m, us, moving_pt, PieceType(cap & 7), was_promotion, prom_pt);
+#endif
+
+                    if (pos2.mover_in_check()) {
+#ifdef USE_NNUE
+                        eval.get_nnue().pop();
+#endif
+                        continue;
+                    }
 
                     nodes++;
                     std::vector<Move> pv_line;
                     Value score;
                     if (i == 0 || window_alpha == -INF) {
-                        score = -negamax(pos2, depth - 1, -beta, -window_alpha, 1, true, pv_line);
+                        score = -negamax(pos2, depth - 1, -beta, -window_alpha, 1, true, pv_line, NO_MOVE);
                     } else {
-                        score = -negamax(pos2, depth - 1, -window_alpha - 1, -window_alpha, 1, true, pv_line);
+                        score = -negamax(pos2, depth - 1, -window_alpha - 1, -window_alpha, 1, true, pv_line, NO_MOVE);
                         if (!stop_search && score > window_alpha && score < beta)
-                            score = -negamax(pos2, depth - 1, -beta, -window_alpha, 1, true, pv_line);
+                            score = -negamax(pos2, depth - 1, -beta, -window_alpha, 1, true, pv_line, NO_MOVE);
                     }
+
+#ifdef USE_NNUE
+                    eval.get_nnue().pop();
+#endif
+
                     if (stop_search) break;
 
                     if (score > depth_score) {
                         depth_score = score;
-                        depth_best  = m;
+                        depth_best = m;
                         pv_line.insert(pv_line.begin(), m);
-                        if (thread_id == 0)
-                            output_info(depth, depth_score, pv_line);
+                        depth_best_pv = pv_line;  // save PV for end-of-depth reporting
+                        if (thread_id == 0 && multi_pv > 1) {
+                            std::lock_guard<std::mutex> lock(root_infos_mutex);
+                            for (auto& info : root_infos) {
+                                if (info.move == m) {
+                                    info.score = score;
+                                    info.pv = pv_line;
+                                    break;
+                                }
+                            }
+                        }
                     }
                     if (score > window_alpha) window_alpha = score;
                 }
 
-                // Widen aspiration on fail
                 if (!stop_search && depth >= 5) {
                     if (depth_score <= alpha && alpha > -INF) {
                         alpha = std::max(Value(-INF), alpha - ASPIRATION_WIDEN);
@@ -2454,19 +3318,230 @@ public:
             }
 
             if (!stop_search && depth_best != NO_MOVE) {
-                best_move  = depth_best;
+                best_move = depth_best;
                 best_score = depth_score;
-                prev_eval  = best_score;
+                prev_eval = best_score;
+                if (thread_id == 0) {
+                    bool best_move_changed = (depth_best != prev_best_move);
+                    tm.update(best_score, best_move_changed);
+                    prev_best_move = depth_best;
+                    // Emit a single info line per depth, AFTER the full depth
+                    // completes — not inside the move loop where nodes/score
+                    // are mid-computation and the node count is misleading.
+                    if (multi_pv <= 1) {
+                        output_info(depth, best_score, depth_best_pv);
+                    }
+                }
+            }
+
+            // Multi-PV barrier
+            if (multi_pv > 1) {
+                int done = ++depth_done_count;
+                if (done == total_threads) {
+                    depth_done_count = 0;
+                    if (thread_id == 0) {
+                        std::lock_guard<std::mutex> lock(root_infos_mutex);
+                        std::sort(root_infos.begin(), root_infos.end());
+                        int n = std::min(multi_pv, (int)root_infos.size());
+                        for (int i = 0; i < n; ++i) {
+                            if (root_infos[i].score > -INF + 1000) {
+                                int64_t elapsed_ms = tm.elapsed();
+                                uint64_t nps_val = elapsed_ms > 0 ? (uint64_t)(nodes * 1000 / elapsed_ms) : 0;
+                                std::cout << "info depth " << depth << " multipv " << i+1 << " score ";
+                                if (std::abs(root_infos[i].score) > MATE_SCORE - 1000) {
+                                    int md = (root_infos[i].score > 0) ? (MATE_SCORE - root_infos[i].score) : (MATE_SCORE + root_infos[i].score);
+                                    std::cout << (root_infos[i].score > 0 ? "mate " : "mate -") << md;
+                                } else {
+                                    std::cout << "cp " << root_infos[i].score;
+                                }
+                                std::cout << " nodes " << nodes << " nps " << nps_val
+                                          << " time " << elapsed_ms << " pv";
+                                // Validate and print PV using move_to_uci for Chess960/promotion correctness
+                                Position pv_tmp = root_pos;
+                                for (Move mv : root_infos[i].pv) {
+                                    if (mv == NO_MOVE) break;
+                                    Move tmp_list[MAX_MOVES];
+                                    int tmp_cnt = generate_moves(pv_tmp, tmp_list);
+                                    bool mv_found = false;
+                                    for (int li = 0; li < tmp_cnt; ++li) {
+                                        if (tmp_list[li] == mv) {
+                                            Position c2 = pv_tmp;
+                                            c2.make_move(mv);
+                                            if (!c2.mover_in_check()) { mv_found = true; break; }
+                                        }
+                                    }
+                                    if (!mv_found) break;
+                                    // Print move (Chess960-aware, promotions suffixed)
+                                    Square mvf = from_sq(mv), mvt = to_sq(mv);
+                                    if (is_castling(mv) && pv_tmp.is_chess960()) {
+                                        Color uc = pv_tmp.piece_on(mvf) ? Color(pv_tmp.piece_on(mvf) >> 3)
+                                                                         : Color((mvf < 32) ? WHITE : BLACK);
+                                        Square rsq = pv_tmp.castle_rook(uc, (mvt > mvf) ? 0 : 1);
+                                        if (rsq != -1) mvt = rsq;
+                                    }
+                                    std::cout << " " << char('a' + file_of(mvf)) << char('1' + rank_of(mvf))
+                                              << char('a' + file_of(mvt)) << char('1' + rank_of(mvt));
+                                    PieceType mp = promotion_type(mv);
+                                    if (mp != NO_PIECE) { const char pc2[] = " pnbrqk"; std::cout << pc2[mp]; }
+                                    pv_tmp.make_move(mv);
+                                }
+                                std::cout << std::endl;
+                            }
+                        }
+                    }
+                    depth_continue = true;
+                } else {
+                    while (!depth_continue) std::this_thread::yield();
+                }
+                int acked = ++depth_ack_count;
+                if (acked == total_threads) {
+                    depth_ack_count = 0;
+                    depth_continue = false;
+                } else {
+                    while (depth_continue) std::this_thread::yield();
+                }
+            }
+        }
+
+        if (best_move != NO_MOVE) {
+            Value prev = shared_best_score.load(std::memory_order_relaxed);
+            while (best_score > prev && !shared_best_score.compare_exchange_weak(prev, best_score, std::memory_order_relaxed)) {}
+            if (best_score >= shared_best_score.load(std::memory_order_relaxed))
                 shared_best_move.store(best_move, std::memory_order_relaxed);
-                shared_best_score.store(best_score, std::memory_order_relaxed);
+        }
+
+        if (local_root_moves.empty()) {
+            idle = true;
+            help_search(this);
+        }
+    }
+
+    void search(int max_depth, uint64_t max_nodes) { search(max_depth, max_nodes, {}); }
+};
+
+// ----------------------------------------------------------------------------
+// Global helper functions for work stealing
+// ----------------------------------------------------------------------------
+void help_search(SearchThread* thread) {
+    while (!stop_search) {
+        SplitPoint* sp = nullptr;
+        {
+            std::unique_lock lock(splits_mutex);
+            splits_cv.wait(lock, []{ return !active_splits.empty() || stop_search; });
+            if (stop_search) return;
+            for (auto* s : active_splits) {
+                if (s->next_move < (int)s->moves.size()) {
+                    sp = s;
+                    break;
+                }
+            }
+        }
+        if (sp) help_at_split(thread, sp);
+    }
+}
+
+void help_at_split(SearchThread* thread, SplitPoint* sp) {
+    sp->workers++;
+    while (true) {
+        int idx = sp->next_move.fetch_add(1);
+        if (idx >= (int)sp->moves.size()) break;
+        Move m = sp->moves[idx].move;
+        if (sp->pos->piece_on(to_sq(m)) && ((sp->pos->piece_on(to_sq(m)) & 7) == KING)) continue;
+
+        int captured = sp->pos->piece_on(to_sq(m));
+        int moving_pc = sp->pos->piece_on(from_sq(m));
+        PieceType moving_pt = PieceType(moving_pc & 7);
+        Color us = sp->pos->side_to_move();
+        bool was_promotion = promotion_type(m) != NO_PIECE;
+        PieceType prom_pt = promotion_type(m);
+        int old_castle = sp->pos->castling_rights(), old_ep = sp->pos->ep_sq(), old_fifty = sp->pos->halfmove_clock();
+
+        Position pos2 = *sp->pos;
+#ifdef USE_NNUE
+        thread->eval.get_nnue().push();
+#endif
+        pos2.make_move(m);
+#ifdef USE_NNUE
+        thread->eval.get_nnue().make_move(pos2, m, us, moving_pt, PieceType(captured & 7), was_promotion, prom_pt);
+#endif
+        if (pos2.mover_in_check()) {
+#ifdef USE_NNUE
+            thread->eval.get_nnue().pop();
+#endif
+            continue;
+        }
+
+        thread->nodes++;
+        Depth new_depth = sp->depth - 1;
+        if (sp->pos->is_check()) new_depth++;
+        std::vector<Move> child_pv;
+        Value score = -thread->negamax(pos2, new_depth, -sp->beta, -sp->alpha, sp->ply + 1, sp->cut, child_pv, NO_MOVE);
+
+#ifdef USE_NNUE
+        thread->eval.get_nnue().pop();
+#endif
+
+        {
+            std::lock_guard<std::mutex> lock(sp->mtx);
+            if (score > sp->best_score) {
+                sp->best_score = score;
+                sp->best_move = m;
+                sp->pv = child_pv;
+                sp->pv.insert(sp->pv.begin(), m);
+                if (score > sp->alpha) sp->alpha = score;
             }
         }
     }
-};
+    sp->workers--;
+    if (sp->workers == 0) {
+        std::lock_guard<std::mutex> lock(sp->mtx);
+        sp->finished = true;
+        sp->cv.notify_one();
+    }
+}
 
 // ============================================================================
-// UCI Interface
+// End of Part 3
 // ============================================================================
+// ============================================================================
+// Part 4 of 4: Hugine 2.0 – UCI Interface and main()
+// ============================================================================
+
+// Format a Move as a UCI string (e.g. "e2e4", "e7e8q", "e1g1").
+// In Chess960 mode (pass the position before the move is made), castling is
+// reported as king-to-rook-square (e.g. "e1h1") as required by UCI_Chess960.
+static std::string move_to_uci(Move m, const Position* pos = nullptr) {
+    if (m == NO_MOVE || m == NULL_MOVE) return "0000";
+    Square from = from_sq(m), to = to_sq(m);
+    // Chess960: remap castling output from king-destination to rook-origin square
+    if (is_castling(m) && pos != nullptr && pos->is_chess960()) {
+        Color us = pos->piece_on(from) != 0
+                   ? Color(pos->piece_on(from) >> 3)
+                   : Color((from < 32) ? WHITE : BLACK);  // fallback
+        int side_idx = (to > from) ? 0 : 1;  // to is g/c — same direction logic
+        Square rook_sq = pos->castle_rook(us, side_idx);
+        if (rook_sq != -1) {
+            std::string s;
+            s += char('a' + file_of(from));
+            s += char('1' + rank_of(from));
+            s += char('a' + file_of(rook_sq));
+            s += char('1' + rank_of(rook_sq));
+            return s;
+        }
+    }
+    std::string s;
+    s += char('a' + file_of(from));
+    s += char('1' + rank_of(from));
+    s += char('a' + file_of(to));
+    s += char('1' + rank_of(to));
+    PieceType prom = promotion_type(m);
+    if (prom != NO_PIECE) {
+        const char pchars[] = " pnbrqk";
+        s += pchars[prom];
+    }
+    return s;
+}
+
 class UCI {
 private:
     Position pos;
@@ -2474,38 +3549,107 @@ private:
     SyzygyTablebase tb;
     Evaluation eval;
     OpeningBook book;
-    std::vector<std::thread> threads;
-    std::atomic<bool> searching;
+    std::vector<std::thread> search_threads;
+    std::atomic<bool> search_active;
+    std::atomic<bool> pondering_active;
     int thread_count;
     int multi_pv;
     bool ponder;
     int contempt;
+    bool chess960;
+    bool uci_limit_strength;
+    int uci_elo;
+    bool learning_enabled;
+    std::string learning_file;
+    int learning_rate;
+    int learning_max_adjust;
+    bool tuning_mode;
+    std::string tuning_file;
+    std::ofstream tuning_stream;
+    std::vector<Move> last_pv;
+    std::mutex last_pv_mutex;
 
 public:
-    UCI() : tt(256), thread_count(1), multi_pv(1), searching(false), ponder(false), contempt(0) {
-        Position::init_zobrist();
+    UCI() : tt(256), search_active(false), pondering_active(false), thread_count(1), multi_pv(1),
+            ponder(false), contempt(0), chess960(false), uci_limit_strength(false), uci_elo(1500),
+            learning_enabled(false), learning_rate(100), learning_max_adjust(50),
+            tuning_mode(false) {
+        Zobrist::init();
         Bitboards::init();
         init_magics();
     }
-    void set_option(const std::string& name, const std::string& value) {
-        if (name == "Hash") { tt.resize(std::stoi(value)); }
-        else if (name == "Threads") thread_count = std::min(std::stoi(value), MAX_THREADS);
-        else if (name == "Ponder") ponder = (value == "true");
-        else if (name == "OwnBook") { if (value == "false") book = OpeningBook(); }
-        else if (name == "BookFile") { if (!value.empty()) book.load(value); }
-        else if (name == "BookVariety") book.set_variety(std::stod(value));
-        else if (name == "SyzygyPath") { if (!value.empty()) tb.init(value); }
-        else if (name == "EvalFile") { 
-#ifdef USE_NNUE
-            eval.set_nnue(value); 
-#endif
-        }
-        else if (name == "MultiPV") multi_pv = std::stoi(value);
-        else if (name == "Contempt") contempt = std::stoi(value);
-        else if (name == "Clear Hash") tt.clear();
-        else if (name == "Move Overhead") tm.set_move_overhead(std::stoi(value));
-        else if (name == "UCI_Chess960") { /* ignore */ }
+
+    ~UCI() {
+        if (tuning_stream.is_open()) tuning_stream.close();
     }
+
+    void set_option(const std::string& name, const std::string& value) {
+        if (name == "Hash") {
+            tt.resize(std::stoi(value));
+        } else if (name == "Threads") {
+            thread_count = std::min(std::stoi(value), MAX_THREADS);
+        } else if (name == "Ponder") {
+            ponder = (value == "true");
+        } else if (name == "OwnBook") {
+            if (value == "false") book = OpeningBook();
+        } else if (name == "BookFile") {
+            if (!value.empty()) book.load(value);
+        } else if (name == "BookVariety") {
+            book.set_variety(std::stod(value));
+        } else if (name == "SyzygyPath") {
+            if (!value.empty()) tb.init(value);
+        } else if (name == "EvalFile") {
+#ifdef USE_NNUE
+            eval.set_nnue(value);
+#endif
+        } else if (name == "MultiPV") {
+            multi_pv = std::stoi(value);
+        } else if (name == "Contempt") {
+            contempt = std::stoi(value);
+            eval.set_contempt(contempt);
+        } else if (name == "Clear Hash") {
+            tt.clear();
+#ifdef DEBUG
+            std::cerr << "DEBUG: Transposition table cleared.\n";
+#endif
+        } else if (name == "Move Overhead") {
+            tm.set_move_overhead(std::stoi(value));
+        } else if (name == "UCI_Chess960") {
+            chess960 = (value == "true");
+            pos.set_chess960(chess960);
+        } else if (name == "UCI_LimitStrength") {
+            uci_limit_strength = (value == "true");
+        } else if (name == "UCI_Elo") {
+            uci_elo = std::stoi(value);
+        } else if (name == "Learning") {
+            learning_enabled = (value == "true");
+            learning.set_enabled(learning_enabled);
+        } else if (name == "LearningFile") {
+            learning_file = value;
+            if (!learning_file.empty()) learning.set_filename(learning_file);
+        } else if (name == "LearningRate") {
+            learning_rate = std::stoi(value);
+            learning.set_learning_rate(learning_rate);
+        } else if (name == "LearningMaxAdjust") {
+            learning_max_adjust = std::stoi(value);
+            learning.set_max_adjust(learning_max_adjust);
+        } else if (name == "Clear Learning") {
+            learning.clear();
+        } else if (name == "Save Learning") {
+            learning.save();
+        } else if (name == "TuningMode") {
+            tuning_mode = (value == "true");
+            if (tuning_mode && !tuning_file.empty()) {
+                tuning_stream.open(tuning_file, std::ios::app);
+            }
+        } else if (name == "TuningFile") {
+            tuning_file = value;
+            if (tuning_mode && !tuning_file.empty()) {
+                tuning_stream.open(tuning_file, std::ios::app);
+            }
+        }
+    }
+
     void position(const std::vector<std::string>& args) {
         size_t i = 0;
         if (i < args.size() && args[i] == "startpos") {
@@ -2520,32 +3664,73 @@ public:
             }
             pos.set_fen(fen);
         }
+        // If the operator has set UCI_Chess960=true, honour it unconditionally.
+        // set_fen() auto-detects chess960 from rook positions, but standard-looking
+        // Chess960 starting positions (where the rooks happen to be on a/h) would
+        // be falsely classified as non-960, breaking the king-to-rook I/O protocol.
+        if (chess960) pos.set_chess960(true);
         if (i < args.size() && args[i] == "moves") {
             i++;
             while (i < args.size()) {
                 std::string ms = args[i++];
+                if (ms.size() < 4) continue;
                 Square from = make_square(ms[0]-'a', ms[1]-'1');
-                Square to = make_square(ms[2]-'a', ms[3]-'1');
-                Move move = make_move(from, to);
+                Square to   = make_square(ms[2]-'a', ms[3]-'1');
+                Move move = NO_MOVE;
+
+                // Promotion (5-char move like e7e8q)
                 if (ms.length() == 5) {
                     char p = ms[4];
                     if (p == 'n') move = make_promotion(from, to, KNIGHT);
                     else if (p == 'b') move = make_promotion(from, to, BISHOP);
                     else if (p == 'r') move = make_promotion(from, to, ROOK);
-                    else move = make_promotion(from, to, QUEEN);
+                    else              move = make_promotion(from, to, QUEEN);
                 }
-                int captured = pos.piece_on(to_sq(move));
-                int old_castle = pos.castling_rights(), old_ep = pos.ep_sq(), old_fifty = pos.halfmove_clock();
+                // Chess960 castling: GUI sends king-to-rook (e.g. e1h1 / e1a1).
+                // Detect by king moving onto its own rook, then remap to the internal
+                // king-destination encoding (g/c file) used throughout the engine.
+                else if ((pos.piece_on(from) & 7) == KING &&
+                         (pos.piece_on(to) & 7) == ROOK &&
+                         (pos.piece_on(to) >> 3) == (pos.piece_on(from) >> 3)) {
+                    Color col = Color(pos.piece_on(from) >> 3);
+                    int castling_rank_p = (col == WHITE) ? 0 : 7;
+                    // side_idx: 0 = kingside (rook to the right), 1 = queenside
+                    int side_idx = (file_of(to) > file_of(from)) ? 0 : 1;
+                    Square king_dest = make_square((side_idx == 0) ? 6 : 2, castling_rank_p);
+                    move = make_move(from, king_dest) | CASTLE_FLAG;
+                }
+                // Standard castling: king moves exactly 2 squares horizontally
+                else if ((pos.piece_on(from) & 7) == KING &&
+                         std::abs(file_of(to) - file_of(from)) == 2) {
+                    move = make_move(from, to) | CASTLE_FLAG;
+                }
+                // En passant: pawn moves diagonally to the en-passant square (must be empty)
+                // MUST check to == pos.ep_sq() — otherwise any diagonal pawn move to an
+                // empty square (impossible in a legal game but theoretically encodable) would
+                // be mis-tagged as en-passant.
+                else if ((pos.piece_on(from) & 7) == PAWN &&
+                         file_of(from) != file_of(to) &&
+                         pos.piece_on(to) == 0 &&
+                         to == pos.ep_sq()) {
+                    move = make_move(from, to) | ENPASSANT_FLAG;
+                }
+                else {
+                    move = make_move(from, to);
+                }
+
                 pos.make_move(move);
             }
         }
     }
+
     void go(const std::vector<std::string>& args) {
+        if (search_active) stop();
+
         int depth = 10;
         uint64_t nodes = 0;
         int64_t wtime = 0, btime = 0, winc = 0, binc = 0;
         int movestogo = 0, movetime = 0;
-        bool infinite = false, ponder = false;
+        bool infinite = false, ponder_mode = false;
         for (size_t i = 0; i < args.size(); ++i) {
             if (args[i] == "depth" && i+1 < args.size()) depth = std::stoi(args[++i]);
             else if (args[i] == "nodes" && i+1 < args.size()) nodes = std::stoull(args[++i]);
@@ -2556,55 +3741,158 @@ public:
             else if (args[i] == "movestogo" && i+1 < args.size()) movestogo = std::stoi(args[++i]);
             else if (args[i] == "movetime" && i+1 < args.size()) movetime = std::stoi(args[++i]);
             else if (args[i] == "infinite") infinite = true;
-            else if (args[i] == "ponder") ponder = true;
+            else if (args[i] == "ponder") ponder_mode = true;
         }
         if (!infinite && movetime == 0 && wtime == 0 && btime == 0) infinite = true;
-        tm.set_side(pos.side_to_move(), wtime, btime, winc, binc, movestogo, movetime, infinite);
-        Move book_move = book.probe(pos);
-        if (book_move != NO_MOVE && !infinite && !ponder) {
-            std::cout << "bestmove " << char('a' + file_of(from_sq(book_move))) << char('1' + rank_of(from_sq(book_move)))
-                     << char('a' + file_of(to_sq(book_move))) << char('1' + rank_of(to_sq(book_move))) << std::endl;
-            return;
+
+        if (uci_limit_strength && !infinite) {
+            int elo_depth = 1 + (uci_elo - 800) / 100;
+            elo_depth = std::clamp(elo_depth, 1, 30);
+            depth = std::min(depth, elo_depth);
         }
-        if (tb.can_probe(pos)) {
-            std::vector<unsigned> results;
-            if (tb.probe_root(pos, results) > 0) {
-                Move tb_move = tb.best_move_from_results(pos, results);
-                if (tb_move != NO_MOVE) {
-                    std::cout << "bestmove " << char('a' + file_of(from_sq(tb_move))) << char('1' + rank_of(from_sq(tb_move)))
-                             << char('a' + file_of(to_sq(tb_move))) << char('1' + rank_of(to_sq(tb_move))) << std::endl;
-                    return;
-                }
+
+        tm.set_side(pos.side_to_move(), wtime, btime, winc, binc, movestogo, movetime, infinite, ponder_mode);
+        tm.set_game_phase(pos.game_phase());
+
+        if (!ponder_mode && !infinite) {
+            Move book_move = book.probe(pos);
+            if (book_move != NO_MOVE) {
+                std::cout << "bestmove " << move_to_uci(book_move, &pos) << std::endl;
+                return;
             }
         }
-        searching = true;
+
+        if (!ponder_mode && tb.can_probe(pos)) {
+            Move tb_move = tb.probe_root_dtz_move(pos);
+            if (tb_move != NO_MOVE) {
+                std::cout << "bestmove " << move_to_uci(tb_move, &pos) << std::endl;
+                return;
+            }
+        }
+
+        stop_search = false;
         shared_best_move = NO_MOVE;
         shared_best_score = -INF;
+        depth_done_count = 0;
+        depth_continue = false;
+        depth_ack_count = 0;
+        root_infos.clear();
+
+        Move moves[MAX_MOVES];
+        int cnt = generate_moves(pos, moves);
+        std::vector<ScoredMove> filtered_root_moves;
+        for (int i = 0; i < cnt; ++i) {
+            Move m = moves[i];
+            if (pos.piece_on(to_sq(m)) && ((pos.piece_on(to_sq(m)) & 7) == KING)) continue;
+            Position tmp = pos;
+            tmp.make_move(m);
+            if (!tmp.mover_in_check()) filtered_root_moves.push_back({m, 0});
+        }
+
+        if (filtered_root_moves.empty()) {
+            std::cout << "bestmove 0000\n";
+            return;
+        }
+
+        double time_factor = 0.5 + filtered_root_moves.size() / 64.0;
+        time_factor = std::clamp(time_factor, 0.2, 1.5);
+        tm.scale_time(time_factor);
+
+        for (const auto& sm : filtered_root_moves) {
+            root_infos.push_back({sm.move, -INF, {}});
+        }
+
+        int total_moves = filtered_root_moves.size();
+        int moves_per_thread = (total_moves + thread_count - 1) / thread_count;
+
+        pondering = ponder_mode;
+        pondering_active = ponder_mode;
+        search_active = true;
+        threads_idle = false;
+
         for (int i = 0; i < thread_count; ++i) {
-            threads.emplace_back([this, i, depth, nodes]() {
-                SearchThread st(i, pos, tt, tb, eval, &book);
-                st.set_multi_pv(multi_pv);
-                st.search(depth, nodes);
+            int start = i * moves_per_thread;
+            int end = std::min(start + moves_per_thread, total_moves);
+            if (start >= total_moves) break;
+
+            std::vector<ScoredMove> thread_moves(
+                filtered_root_moves.begin() + start,
+                filtered_root_moves.begin() + end
+            );
+
+            search_threads.emplace_back([this, i, depth, nodes, thread_moves]() {
+                auto st = std::make_unique<SearchThread>(i, thread_count, pos, tt, tb, eval, &book);
+                st->set_multi_pv(multi_pv);
+                st->search(depth, nodes, thread_moves);
             });
         }
-        for (auto& t : threads) if (t.joinable()) t.join();
-        threads.clear();
+
+        if (!ponder_mode) {
+            for (auto& t : search_threads) {
+                if (t.joinable()) t.join();
+            }
+            search_threads.clear();
+            search_active = false;
+
+            if (!root_infos.empty()) {
+                std::lock_guard<std::mutex> lock(last_pv_mutex);
+                auto best_it = std::max_element(root_infos.begin(), root_infos.end());
+                if (best_it != root_infos.end() && best_it->score > -INF + 1000) {
+                    last_pv = best_it->pv;
+                }
+            }
+
+            Move best = shared_best_move.load();
+            if (best == NO_MOVE && !filtered_root_moves.empty()) {
+                best = filtered_root_moves[0].move;
+            }
+            std::cout << "bestmove " << move_to_uci(best, &pos) << std::endl;
+
+            if (tuning_mode && tuning_stream.is_open()) {
+                tuning_stream << pos.fen() << "\t" << shared_best_score.load() << "\t?\n";
+                tuning_stream.flush();
+            }
+        }
+    }
+
+    void stop() {
+        if (!search_active) return;
+        stop_search = true;
+        pondering = false;
+        for (auto& t : search_threads) {
+            if (t.joinable()) t.join();
+        }
+        search_threads.clear();
+        search_active = false;
+        pondering_active = false;
+        Move best = shared_best_move.load();
+        if (best != NO_MOVE) {
+            std::cout << "bestmove " << move_to_uci(best, &pos) << std::endl;
+        }
+    }
+
+    void ponderhit() {
+        if (!search_active || !pondering_active) return;
+        pondering = false;
+        pondering_active = false;
+        for (auto& t : search_threads) {
+            if (t.joinable()) t.join();
+        }
+        search_threads.clear();
+        search_active = false;
         Move best = shared_best_move.load();
         if (best == NO_MOVE) {
-            Move moves[256];
+            Move moves[MAX_MOVES];
             int cnt = generate_moves(pos, moves);
             if (cnt > 0) best = moves[0];
         }
-        std::cout << "bestmove " << char('a' + file_of(from_sq(best))) << char('1' + rank_of(from_sq(best)))
-                 << char('a' + file_of(to_sq(best))) << char('1' + rank_of(to_sq(best))) << std::endl;
-        searching = false;
+        if (best != NO_MOVE) {
+            std::cout << "bestmove " << move_to_uci(best, &pos) << std::endl;
+        } else {
+            std::cout << "bestmove 0000\n";
+        }
     }
-    void stop() {
-        stop_search = true;
-        for (auto& t : threads) if (t.joinable()) t.join();
-        threads.clear();
-        searching = false;
-    }
+
     void run() {
         std::string line;
         while (std::getline(std::cin, line)) {
@@ -2612,8 +3900,8 @@ public:
             std::string token;
             iss >> token;
             if (token == "uci") {
-                std::cout << "id name Hugine Ultimate Final\n";
-                std::cout << "id author Hugine\n";
+                std::cout << "id name Hugine 2.0\n";
+                std::cout << "id author 0xbytecode\n";
                 std::cout << "info string Platform: "
 #if ARCH_X86
                           << "x86"
@@ -2634,6 +3922,8 @@ public:
 #else
                           << "OFF"
 #endif
+                          << " | Chess960: "
+                          << (chess960 ? "ON" : "OFF")
                           << "\n";
                 std::cout << "option name Hash type spin default 256 min 1 max 8192\n";
                 std::cout << "option name Threads type spin default 1 min 1 max 64\n";
@@ -2647,6 +3937,16 @@ public:
                 std::cout << "option name Contempt type spin default 0 min -100 max 100\n";
                 std::cout << "option name Move Overhead type spin default 100 min 0 max 5000\n";
                 std::cout << "option name UCI_Chess960 type check default false\n";
+                std::cout << "option name UCI_LimitStrength type check default false\n";
+                std::cout << "option name UCI_Elo type spin default 1500 min 800 max 3000\n";
+                std::cout << "option name Learning type check default false\n";
+                std::cout << "option name LearningFile type string default\n";
+                std::cout << "option name LearningRate type spin default 100 min 1 max 1000\n";
+                std::cout << "option name LearningMaxAdjust type spin default 50 min 0 max 200\n";
+                std::cout << "option name Clear Learning type button\n";
+                std::cout << "option name Save Learning type button\n";
+                std::cout << "option name TuningMode type check default false\n";
+                std::cout << "option name TuningFile type string default\n";
                 std::cout << "option name Clear Hash type button\n";
                 std::cout << "uciok\n";
             } else if (token == "isready") {
@@ -2655,7 +3955,14 @@ public:
                 pos.init_startpos();
                 tt.clear();
             } else if (token == "setoption") {
+                // UCI protocol: "setoption name <OptionName> value <Value>"
+                // Must consume the literal "name" keyword first, otherwise it
+                // gets prepended to every option name and set_option never matches.
                 std::string name, value, word;
+                if (iss >> word && word != "name") {
+                    // Malformed — put the word back as the start of the name
+                    name = word;
+                }
                 while (iss >> word) {
                     if (word == "value") break;
                     if (!name.empty()) name += " ";
@@ -2674,27 +3981,224 @@ public:
             } else if (token == "stop") {
                 stop();
             } else if (token == "ponderhit") {
-                // ignore
+                ponderhit();
+            } else if (token == "learn") {
+                std::string subcmd;
+                iss >> subcmd;
+                if (subcmd == "result") {
+                    std::string result_str;
+                    iss >> result_str;
+                    int result = 0;
+                    if (result_str == "win") result = 1;
+                    else if (result_str == "loss") result = -1;
+                    {
+                        std::lock_guard<std::mutex> lock(last_pv_mutex);
+                        if (last_pv.empty()) {
+                            std::cout << "info string No PV available from last search.\n";
+                            return;
+                        }
+                        Position tmp = pos;
+                        for (Move m : last_pv) {
+                            U64 key = tmp.get_hash();
+                            learning.update(key, result, tmp.side_to_move());
+                            tmp.make_move(m);
+                        }
+                        std::cout << "info string Learning updated with " << last_pv.size() << " positions.\n";
+                    }
+                } else if (subcmd == "clear") {
+                    learning.clear();
+                    std::cout << "info string Learning table cleared.\n";
+                } else if (subcmd == "save") {
+                    if (learning.save())
+                        std::cout << "info string Learning saved.\n";
+                    else
+                        std::cout << "info string Failed to save learning.\n";
+                } else {
+                    std::cout << "info string Unknown learn subcommand. Use: result win|draw|loss, clear, save\n";
+                }
             } else if (token == "quit") {
                 stop();
                 break;
             } else if (token == "d") {
-                std::cout << pos.fen() << std::endl;
+                // Board display
+                std::cout << "\n";
                 for (int r = 7; r >= 0; --r) {
+                    std::cout << " " << (r+1) << "  ";
                     for (int f = 0; f < 8; ++f) {
                         Square sq = make_square(f, r);
                         int pc = pos.piece_on(sq);
-                        if (pc == 0) std::cout << ". ";
+                        if (pc == 0) std::cout << ".";
                         else {
                             char p = " pnbrqk"[pc & 7];
                             if ((pc >> 3) == WHITE) p = toupper(p);
-                            std::cout << p << ' ';
+                            std::cout << p;
+                        }
+                        std::cout << " ";
+                    }
+                    std::cout << "\n";
+                }
+                std::cout << "\n     a b c d e f g h\n\n";
+                std::cout << "FEN  : " << pos.fen() << "\n";
+                std::cout << "Side : " << (pos.side_to_move() == WHITE ? "White" : "Black") << "\n";
+                std::cout << "EP   : ";
+                if (pos.ep_sq() != -1)
+                    std::cout << char('a' + file_of(pos.ep_sq())) << char('1' + rank_of(pos.ep_sq()));
+                else std::cout << "-";
+                std::cout << "\n";
+                std::cout << "50mr : " << pos.halfmove_clock() << "\n";
+
+                // ---- Castling rights diagnostic ----
+                // Shows exactly what was parsed from the FEN for each of the 4 slots.
+                const char* slot_names[2][2] = {{"White-K (O-O)","White-Q (O-O-O)"},
+                                                 {"Black-k (o-o)","Black-q (o-o-o)"}};
+                std::cout << "Castle rights:\n";
+                bool any_right = false;
+                for (int c = 0; c < 2; ++c) {
+                    for (int s = 0; s < 2; ++s) {
+                        Square rsq = pos.castle_rook(Color(c), s);
+                        std::cout << "  " << slot_names[c][s] << ": ";
+                        if (rsq == -1) {
+                            std::cout << "NONE\n";
+                        } else {
+                            char rf = char('a' + file_of(rsq));
+                            char rr = char('1' + rank_of(rsq));
+                            // Determine expected destination for king and rook
+                            int castling_rank = (c == 0) ? 0 : 7;
+                            Square king_dest = make_square((s == 0) ? 6 : 2, castling_rank);
+                            Square rook_dest = make_square((s == 0) ? 5 : 3, castling_rank);
+                            std::cout << "ROOK on " << rf << rr
+                                      << " -> king lands "
+                                      << char('a' + file_of(king_dest)) << char('1' + rank_of(king_dest))
+                                      << ", rook lands "
+                                      << char('a' + file_of(rook_dest)) << char('1' + rank_of(rook_dest))
+                                      << "\n";
+                            any_right = true;
                         }
                     }
-                    std::cout << std::endl;
                 }
+                if (!any_right) std::cout << "  (no castling rights)\n";
+                std::cout << "\n";
+
             } else if (token == "eval") {
-                std::cout << "Evaluation: " << eval.evaluate(pos) << " cp\n";
+                Value score = eval.evaluate(pos);
+                std::cout << "Evaluation: " << score << " cp (from side to move)\n";
+            } else if (token == "perft") {
+                // ------------------------------------------------------------
+                // Perft – divide at depth 1, timing, correct undo state
+                //
+                // captured passed to undo_move is always board[to] BEFORE the
+                // move (i.e. 0 for castling/ep since those squares are empty).
+                // undo_move's own is_castling / is_en_passant branches handle
+                // rook and captured-pawn restoration without using that value.
+                // ------------------------------------------------------------
+                int depth = 1;
+                {
+                    std::string tok;
+                    if (iss >> tok) depth = std::stoi(tok);
+                }
+                if (depth < 1) depth = 1;
+
+                // ---- Verify castle flag encoding round-trip ----
+                // Every castling move generated must have CASTLE_FLAG set and
+                // its to-square must be the fixed king destination (g/c file).
+                // We print a one-time confirmation at the start of each perft.
+                {
+                    Move probe[MAX_MOVES];
+                    int pcnt = generate_moves(pos, probe);
+                    int castle_count = 0;
+                    bool flag_ok = true;
+                    for (int i = 0; i < pcnt; ++i) {
+                        if (is_castling(probe[i])) {
+                            castle_count++;
+                            int castling_rank_p = (pos.side_to_move() == WHITE) ? 0 : 7;
+                            Square kd = to_sq(probe[i]);
+                            bool ks = (kd == make_square(6, castling_rank_p));
+                            bool qs = (kd == make_square(2, castling_rank_p));
+                            if (!ks && !qs) flag_ok = false;
+                        }
+                    }
+                    std::cout << "info string Castle-flag check: "
+                              << castle_count << " castle move(s) in root position, "
+                              << (flag_ok ? "all destinations correct (g/c file)." : "ERROR: unexpected king destination!")
+                              << "\n";
+
+                    // Also confirm castling rights were parsed from FEN
+                    int rights_count = 0;
+                    for (int c = 0; c < 2; ++c)
+                        for (int s = 0; s < 2; ++s)
+                            if (pos.castle_rook(Color(c), s) != -1) rights_count++;
+                    std::cout << "info string FEN castling rights loaded: "
+                              << rights_count << " slot(s) active.\n";
+                }
+
+                // ---- Recursive perft with make/undo ----
+                // Returns the number of leaf nodes at depth d from position p.
+                // Legal-move filter: make the move, check mover_in_check(), undo.
+                std::function<uint64_t(Position&, int)> perft_r =
+                    [&](Position& p, int d) -> uint64_t {
+                    Move mvs[MAX_MOVES];
+                    int cnt = generate_moves(p, mvs);
+
+                    // Bulk-count at depth 1: just count legal moves, no recursion
+                    if (d == 1) {
+                        uint64_t legal = 0;
+                        for (int i = 0; i < cnt; ++i) {
+                            // captured = piece currently on the target square
+                            // (0 for ep and castling since those squares are empty)
+                            int cap = p.piece_on(to_sq(mvs[i]));
+                            int old_cr = p.castling_rights();
+                            int old_ep = p.ep_sq();
+                            int old_50 = p.halfmove_clock();
+                            p.make_move(mvs[i]);
+                            if (!p.mover_in_check()) ++legal;
+                            p.undo_move(mvs[i], cap, old_cr, old_ep, old_50);
+                        }
+                        return legal;
+                    }
+
+                    uint64_t nodes = 0;
+                    for (int i = 0; i < cnt; ++i) {
+                        int cap = p.piece_on(to_sq(mvs[i]));
+                        int old_cr = p.castling_rights();
+                        int old_ep = p.ep_sq();
+                        int old_50 = p.halfmove_clock();
+                        p.make_move(mvs[i]);
+                        if (!p.mover_in_check())
+                            nodes += perft_r(p, d - 1);
+                        p.undo_move(mvs[i], cap, old_cr, old_ep, old_50);
+                    }
+                    return nodes;
+                };
+
+                // ---- Divide: report each root move's subtree count ----
+                auto t0 = std::chrono::steady_clock::now();
+
+                Move root_mvs[MAX_MOVES];
+                int root_cnt = generate_moves(pos, root_mvs);
+                uint64_t total = 0;
+                for (int i = 0; i < root_cnt; ++i) {
+                    int cap = pos.piece_on(to_sq(root_mvs[i]));
+                    int old_cr = pos.castling_rights();
+                    int old_ep = pos.ep_sq();
+                    int old_50 = pos.halfmove_clock();
+                    pos.make_move(root_mvs[i]);
+                    if (!pos.mover_in_check()) {
+                        uint64_t n = (depth <= 1) ? 1 : perft_r(pos, depth - 1);
+                        pos.undo_move(root_mvs[i], cap, old_cr, old_ep, old_50);
+                        std::cout << move_to_uci(root_mvs[i], &pos) << ": " << n << "\n";
+                        total += n;
+                    } else {
+                        pos.undo_move(root_mvs[i], cap, old_cr, old_ep, old_50);
+                    }
+                }
+
+                auto t1 = std::chrono::steady_clock::now();
+                double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+                uint64_t nps = ms > 0 ? (uint64_t)(total / (ms / 1000.0)) : 0;
+                std::cout << "\nNodes searched: " << total
+                          << "  depth: " << depth
+                          << "  time: " << (uint64_t)ms << "ms"
+                          << "  nps: " << nps << "\n";
             }
         }
     }
