@@ -44,6 +44,8 @@
 #include <iomanip>
 #include <numeric>
 #include <condition_variable>
+#include <dirent.h>   // opendir/readdir for NNUE directory scan
+#include <sys/stat.h> // stat() for file-vs-directory detection
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
@@ -89,6 +91,14 @@
     #define USE_SSE41 1
 #elif defined(__ARM_NEON)
     #define USE_NEON 1
+#endif
+
+// SIMD headers
+#if defined(USE_AVX2) || defined(USE_SSE41)
+    #include <immintrin.h>
+#endif
+#if defined(USE_NEON)
+    #include <arm_neon.h>
 #endif
 
 // ---------------------------------------------------------------------------
@@ -1393,6 +1403,7 @@ private:
     };
     Layer ft, l1, l2, output;
     int16_t output_bias;
+    bool loaded = false;  // true only after a valid net file is loaded
 
     struct Accumulator {
         std::vector<int16_t> values;
@@ -1473,8 +1484,10 @@ public:
         file.read((char*)&l1_size, sizeof(l1_size));
         file.read((char*)&l2_size, sizeof(l2_size));
         file.read((char*)&out_dim, sizeof(out_dim));
-        if (magic != 0x5A5A5A5A || version != 2 || ft_inputs != FT_INPUTS || ft_size != FT_SIZE || l1_size != L1_SIZE || l2_size != L2_SIZE || out_dim != 1)
+        if (magic != 0x5A5A5A5A || version != 2 || ft_inputs != FT_INPUTS || ft_size != FT_SIZE || l1_size != L1_SIZE || l2_size != L2_SIZE || out_dim != 1) {
+            loaded = false;
             return false;
+        }
         auto read_layer = [&](Layer& l, size_t cnt, size_t bias_size) {
             l.weights.resize(cnt);
             l.bias.resize(bias_size);
@@ -1487,6 +1500,7 @@ public:
         output.weights.resize(L2_SIZE);
         file.read((char*)output.weights.data(), L2_SIZE * sizeof(int8_t));
         file.read((char*)&output_bias, sizeof(int16_t));
+        loaded = true;
         return true;
     }
 
@@ -1496,10 +1510,17 @@ public:
         else { s0.push_back(s0.back()); s1.push_back(s1.back()); }
     }
 
-    void pop() { tls.stack[0].pop_back(); tls.stack[1].pop_back(); }
+    void pop() {
+        // Guard against underflow (e.g. search aborted mid-flight)
+        if (!tls.stack[0].empty()) tls.stack[0].pop_back();
+        if (!tls.stack[1].empty()) tls.stack[1].pop_back();
+    }
+
+    bool is_loaded() const { return loaded; }
 
     void make_move(const Position& pos, Move m, Color us, PieceType moving_pt, PieceType captured_pt,
                    bool was_promotion, PieceType prom_pt = NO_PIECE) {
+        if (tls.stack[0].empty()) return;  // stack not initialised — nothing to update
         Color them = Color(us ^ 1);
         Square from = from_sq(m), to = to_sq(m);
         auto& acc0 = tls.stack[0].back();
@@ -1533,6 +1554,11 @@ public:
     }
 
     int evaluate(const Position& pos) {
+        if (!loaded) return 0;  // no valid net — caller should use classical eval
+        // If called outside a push/pop frame (e.g. priming call at root),
+        // bootstrap a fresh accumulator onto the stack instead of crashing.
+        bool priming = tls.stack[0].empty();
+        if (priming) push();
         auto& acc0 = tls.stack[0].back();
         if (!acc0.computed) recompute_accumulator(acc0, pos, WHITE);
         alignas(32) int16_t l0[FT_SIZE];
@@ -1578,7 +1604,9 @@ public:
         for (int i = 0; i < L2_SIZE; ++i) out += l2_out[i] * output.weights[i];
         out = (out * HIDDEN_SCALE) >> 8;
         Value score = out / 16;
-        return (pos.side_to_move() == WHITE) ? score : -score;
+        Value result = (pos.side_to_move() == WHITE) ? score : -score;
+        if (priming) pop();  // clean up the temporary frame we pushed above
+        return result;
     }
 };
 
@@ -1788,7 +1816,45 @@ public:
     }
     void set_contempt(int c) { contempt = c; }
 #ifdef USE_NNUE
-    void set_nnue(const std::string& file) { nnue.load(file); }
+    // Load NNUE from a path that can be either a file or a directory.
+    // If it's a directory, scan alphabetically and load the first valid .nnue.
+    // Returns the full path of the file loaded, or "" on failure.
+    std::string load_nnue(const std::string& path) {
+        if (path.empty()) return "";
+        // Check if it's a directory first
+        struct stat st;
+        if (stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode))
+            return load_nnue_from_dir(path);
+        // Treat as a direct file path
+        return set_nnue(path) ? path : "";
+    }
+    // Load a single .nnue file directly. Returns true on success.
+    bool set_nnue(const std::string& file) {
+        bool ok = nnue.load(file);
+        return ok;
+    }
+    // Scan a directory for .nnue files and load the first valid one.
+    std::string load_nnue_from_dir(const std::string& dir) {
+        if (dir.empty()) return "";
+        struct dirent* entry;
+        DIR* dp = opendir(dir.c_str());
+        if (!dp) return "";
+        std::vector<std::string> candidates;
+        while ((entry = readdir(dp)) != nullptr) {
+            std::string n = entry->d_name;
+            if (n.size() > 5 && n.substr(n.size()-5) == ".nnue")
+                candidates.push_back(n);
+        }
+        closedir(dp);
+        std::sort(candidates.begin(), candidates.end());
+        std::string sep = (dir.back() == '/') ? "" : "/";
+        for (auto& f : candidates) {
+            std::string full = dir + sep + f;
+            if (nnue.load(full)) return full;
+        }
+        return "";
+    }
+    bool nnue_is_loaded() const { return nnue.is_loaded(); }
     NNUEEvaluator& get_nnue() { return nnue; }
 #endif
 
@@ -2023,7 +2089,7 @@ public:
         if (dyn_contempt != 0 && !pos.is_endgame() && std::abs(score) < 200) score += dyn_contempt;
 
 #ifdef USE_NNUE
-        if (nnue_weight > 0) {
+        if (nnue_weight > 0 && nnue.is_loaded()) {
             int nn = nnue.evaluate(pos);
             return Value(nnue_weight * nn + (1.0 - nnue_weight) * score);
         }
@@ -2216,11 +2282,21 @@ public:
     OpeningBook() : loaded(false), variety(0.0) {}
     bool load(const std::string& path) {
         std::ifstream file(path, std::ios::binary);
-        if (!file) return false;
+        if (!file) {
+            std::cout << "info string Book load FAILED (cannot open): " << path << "\n";
+            return false;
+        }
         entries.clear();
         Entry e;
         while (file.read((char*)&e, sizeof(e))) entries.push_back(e);
+        if (entries.empty()) {
+            std::cout << "info string Book load FAILED (file empty or wrong format): " << path << "\n";
+            loaded = false;
+            return false;
+        }
         loaded = true;
+        std::cout << "info string Book loaded: " << path
+                  << " (" << entries.size() << " entries)\n";
         return true;
     }
     void set_variety(double v) { variety = v; }
@@ -2229,7 +2305,11 @@ public:
         U64 key = pos.get_hash();
         std::vector<Entry> matches;
         for (const auto& e : entries) if (e.key == key) matches.push_back(e);
-        if (matches.empty()) return NO_MOVE;
+        if (matches.empty()) {
+            // Uncomment for verbose book miss tracing:
+            // std::cout << "info string Book miss (hash " << std::hex << key << std::dec << ")\n";
+            return NO_MOVE;
+        }
         if (variety == 0.0) {
             auto it = std::max_element(matches.begin(), matches.end(),
                 [](const Entry& a, const Entry& b) { return a.weight < b.weight; });
@@ -2505,6 +2585,11 @@ public:
         start_time = current_time();
         infinite = inf; pondering = pond;
         if (movetime > 0) { move_time = movetime; soft_limit = hard_limit = move_time; return; }
+        // No clock info at all → depth-controlled search; treat as infinite so TM never
+        // cuts it short. The search loop's "depth <= max_depth" is the real limiter.
+        if (wtime == 0 && btime == 0 && !infinite && !pondering) {
+            infinite = true; move_time = 0; soft_limit = hard_limit = INT64_MAX; return;
+        }
         if (infinite || pondering) { move_time = 0; soft_limit = hard_limit = INT64_MAX; return; }
         time_left = (side == WHITE) ? wtime : btime;
         increment = (side == WHITE) ? winc : binc;
@@ -2573,30 +2658,6 @@ class SearchThread;
 struct ScoredMove;
 
 // YBWC split point
-struct SplitPoint {
-    Position* pos;
-    SearchThread* master;
-    std::vector<ScoredMove> moves;
-    std::atomic<int> next_move;
-    int depth, ply;
-    Value alpha, beta;
-    bool cut;
-    std::mutex mtx;
-    std::condition_variable cv;
-    std::atomic<int> workers;
-    bool finished;
-    Value best_score;
-    Move best_move;
-    std::vector<Move> pv;
-    SplitPoint() : pos(nullptr), master(nullptr), next_move(0), depth(0), ply(0),
-                   alpha(-INF), beta(INF), cut(false), workers(0), finished(false),
-                   best_score(-INF), best_move(NO_MOVE) {}
-};
-std::vector<SplitPoint*> active_splits;
-std::mutex splits_mutex;
-std::condition_variable splits_cv;
-std::atomic<bool> threads_idle{false};
-
 // Per‑ply stack
 struct Stack {
     Move killers[2];
@@ -2627,8 +2688,7 @@ LearningTable learning;
 // ============================================================================
 
 // Forward declarations for YBWC helpers
-void help_search(SearchThread* thread);
-void help_at_split(SearchThread* thread, SplitPoint* sp);
+
 
 class SearchThread {
 private:
@@ -2655,19 +2715,17 @@ private:
     Move prev_best_move = NO_MOVE;
 
 public:
-    bool idle;
-    // Accessor for YBWC split-point helpers that need NNUE state
+    // Accessor so eval is accessible externally (e.g. NNUE in make/undo wrappers)
     Evaluation& get_eval() { return eval; }
-    // Triangular PV table — stack-allocated, accessed by YBWC helpers
+    // Triangular PV table — stack-allocated
     Move pv_table[MAX_PLY][MAX_PLY];
     int  pv_len[MAX_PLY];
-    SplitPoint* current_split;
     std::atomic<uint64_t> nodes;
 
     SearchThread(int id, int total, Position& pos, TranspositionTable& t, SyzygyTablebase& tbb, Evaluation& e, OpeningBook* b, bool wdl = false)
         : thread_id(id), total_threads(total), root_pos(pos), tt(t), tb(tbb), eval(e), book(b),
           multi_pv(1), show_wdl(wdl),
-          idle(false), current_split(nullptr), nodes(0) {
+          nodes(0) {
         memset(history, 0, sizeof(history));
         memset(butterfly_history, 0, sizeof(butterfly_history));
         memset(correction_history, 0, sizeof(correction_history));
@@ -2745,6 +2803,7 @@ public:
         Square from = from_sq(m), to = to_sq(m);
         int moving_pc = pos.piece_on(from);
         int pt = moving_pc & 7;
+        if (pt == 0) return s;  // empty square — skip history lookups (can occur in YBWC)
         int piece_idx = us * 6 + (pt - 1);
         s += history[us][from][to];
         s += butterfly_history[piece_idx][to] / 4;
@@ -2781,6 +2840,7 @@ public:
         Color us = pos.side_to_move();
         int moving_pc = pos.piece_on(from);
         int pt = moving_pc & 7;
+        if (pt == 0) return;  // safety guard
         int piece_idx = us * 6 + (pt - 1);
         int delta = depth * depth;
         if (good) {
@@ -2831,6 +2891,7 @@ public:
         Color us = pos.side_to_move();
         int moving_pc = pos.piece_on(from);
         int pt = moving_pc & 7;
+        if (pt == 0) return;  // safety guard
         int cur_piece_idx = us * 6 + (pt - 1);
         int prev_piece_idx = stack[ply-1].current_piece_idx;
         if (prev_piece_idx == -1) return;
@@ -2853,7 +2914,7 @@ public:
             return eval.evaluate(pos) + learning.probe(pos.get_hash());
         if ((++nodes & 255) == 0) {
             if (stop_search) return 0;
-            if (tm.stop_early()) { stop_search = true; return 0; }
+            if (thread_id == 0 && tm.stop_early()) { stop_search = true; return 0; }
             if (node_limit > 0 && nodes >= node_limit) { stop_search = true; return 0; }
         }
         if (pos.is_repetition(1)) return 0;
@@ -3011,7 +3072,7 @@ public:
         if (ply >= MAX_PLY) return eval.evaluate(pos) + learning.probe(pos.get_hash());
         if ((++nodes & 255) == 0) {
             if (stop_search) return 0;
-            if (tm.stop_early()) { stop_search = true; return 0; }
+            if (thread_id == 0 && tm.stop_early()) { stop_search = true; return 0; }
             if (node_limit > 0 && nodes >= node_limit) { stop_search = true; return 0; }
         }
         // Use count=1: return draw score when position appeared once before in
@@ -3185,59 +3246,9 @@ public:
         Bound bound = BOUND_UPPER;
         bool improving = (ply >= 2 && static_eval > stack[ply-2].static_eval);
 
-        // YBWC split attempt
-        if (total_threads > 1 && depth >= 6 && scored_count > 5 && !idle) {
-            SplitPoint* sp = new SplitPoint;
-            sp->pos = &pos;
-            sp->master = this;
-            sp->moves.assign(scored, scored + scored_count);
-            sp->depth = depth;
-            sp->ply = ply;
-            sp->alpha = alpha;
-            sp->beta = beta;
-            sp->cut = cut;
-            sp->next_move = 0;
-            sp->workers = 0;
-            sp->finished = false;
-            sp->best_score = -INF;
-            sp->best_move = NO_MOVE;
-            {
-                std::lock_guard<std::mutex> lock(splits_mutex);
-                active_splits.push_back(sp);
-                splits_cv.notify_all();
-            }
-            help_at_split(this, sp);
-            {
-                std::unique_lock<std::mutex> lock(sp->mtx);
-                sp->cv.wait(lock, [sp]{ return sp->finished; });
-            }
-            {
-                std::lock_guard<std::mutex> lock(splits_mutex);
-                active_splits.erase(std::remove(active_splits.begin(), active_splits.end(), sp), active_splits.end());
-            }
-            // Triangular PV from YBWC split
-            best_score = sp->best_score;
-            best_move  = sp->best_move;
-            if (!sp->pv.empty()) {
-                int splen = (int)sp->pv.size();
-                for (int _pvi = 0; _pvi < splen && ply+_pvi < MAX_PLY; ++_pvi)
-                    pv_table[ply][_pvi] = sp->pv[_pvi];
-                pv_len[ply] = splen;
-            }
-            delete sp;
-            if (best_score != -INF) {
-                if (best_score >= beta) bound = BOUND_LOWER;
-                else if (best_score > alpha) bound = BOUND_EXACT;
-                Value store = best_score;
-                if (store > MATE_THRESHOLD) {
-                    store -= ply;   // root-relative: subtract ply for winning mates
-                } else if (store < -MATE_THRESHOLD) {
-                    store += ply;   // root-relative: add ply for losing mates
-                }
-                tt.store(key, depth, store, bound, best_move);
-                return best_score;
-            }
-        }
+        // Note: multi-threading is handled at root level via Lazy SMP (each thread
+        // runs its own independent iterative-deepening search). YBWC was removed
+        // because it shared a single Position* among worker threads causing data races.
 
         // Normal move loop
         for (int i = 0; i < scored_count; ++i) {
@@ -3457,9 +3468,9 @@ public:
         if (std::abs(score) > MATE_SCORE - 1000) {
             int mate_dist = (score > 0) ? (MATE_SCORE - score) : (MATE_SCORE + score);
             if (mate_dist < 0) mate_dist = 0;
-            score_str = (score > 0) ? "mate " + std::to_string(mate_dist) : "mate -" + std::to_string(mate_dist);
+            score_str = (score > 0) ? "score mate " + std::to_string(mate_dist) : "score mate -" + std::to_string(mate_dist);
         } else {
-            score_str = "cp " + std::to_string(score);
+            score_str = "score cp " + std::to_string(score);
         }
         std::cout << "info depth " << depth << " " << score_str
                   << " nodes " << nodes << " nps " << nps
@@ -3526,49 +3537,51 @@ public:
     // Main search entry (root)
     // ------------------------------------------------------------------------
     void search(int max_depth, uint64_t max_nodes, const std::vector<ScoredMove>& root_moves) {
-        stop_search = false;
+        // NOTE: stop_search, node_limit, tb_hits, and tt.new_search() are
+        // initialized ONCE in go() before threads launch — not here.
+        // Each thread resets only its own per-thread counters.
         nodes = 0;
-        node_limit = max_nodes;
-        tb_hits = 0;
-        tt.new_search();
+
+        // Each thread gets its own local copy of the position.
+        // This is the critical Lazy SMP safety guarantee: threads never
+        // mutate the shared root_pos reference — each has its own state.
+        Position local_pos = root_pos;
 
         std::vector<ScoredMove> local_root_moves = root_moves;
         if (local_root_moves.empty()) {
             Move moves[MAX_MOVES];
-            int cnt = generate_moves(root_pos, moves);
+            int cnt = generate_moves(local_pos, moves);
             for (int i = 0; i < cnt; ++i) {
                 Move m = moves[i];
-                if (root_pos.piece_on(to_sq(m)) && ((root_pos.piece_on(to_sq(m)) & 7) == KING)) continue;
-                // Use make/undo — no heap alloc (avoids OOM on Android/ARM)
-                int cap    = root_pos.piece_on(to_sq(m));
-                int old_cr = root_pos.castling_rights();
-                int old_ep = root_pos.ep_sq();
-                int old_50 = root_pos.halfmove_clock();
-                root_pos.make_move(m);
-                bool legal = !root_pos.mover_in_check();
-                root_pos.undo_move(m, cap, old_cr, old_ep, old_50);
+                if (local_pos.piece_on(to_sq(m)) && ((local_pos.piece_on(to_sq(m)) & 7) == KING)) continue;
+                int cap    = local_pos.piece_on(to_sq(m));
+                int old_cr = local_pos.castling_rights();
+                int old_ep = local_pos.ep_sq();
+                int old_50 = local_pos.halfmove_clock();
+                local_pos.make_move(m);
+                bool legal = !local_pos.mover_in_check();
+                local_pos.undo_move(m, cap, old_cr, old_ep, old_50);
                 if (legal) local_root_moves.push_back({m, 0});
             }
         }
         if (local_root_moves.empty()) return;
 
 #ifdef USE_NNUE
-        eval.get_nnue().evaluate(root_pos);
+        eval.get_nnue().evaluate(local_pos);
 #endif
 
         Move best_move = local_root_moves[0].move;
         Value best_score = -INF;
         prev_best_move = NO_MOVE;
-        idle = false;
 
         for (int depth = 1; depth <= max_depth && !stop_search; ++depth) {
-            if (depth > 1 && !tm.time_for_depth(depth)) break;
+            if (depth > 1 && thread_id == 0 && !tm.time_for_depth(depth)) break;
 
             root_depth = depth;   // used by extension budget in negamax()
 
             for (auto& sm : local_root_moves) {
-                int captured = root_pos.piece_on(to_sq(sm.move)) != 0;
-                sm.score = score_move(sm.move, 0, (best_move != NO_MOVE ? best_move : NO_MOVE), root_pos, 0, captured);
+                int captured = local_pos.piece_on(to_sq(sm.move)) != 0;
+                sm.score = score_move(sm.move, 0, (best_move != NO_MOVE ? best_move : NO_MOVE), local_pos, 0, captured);
             }
             if (best_move != NO_MOVE) {
                 for (auto& sm : local_root_moves)
@@ -3614,34 +3627,34 @@ public:
 
                 for (size_t i = 0; i < local_root_moves.size() && !stop_search; ++i) {
                     Move m = local_root_moves[i].move;
-                    if (root_pos.piece_on(to_sq(m)) && ((root_pos.piece_on(to_sq(m)) & 7) == KING)) continue;
+                    if (local_pos.piece_on(to_sq(m)) && ((local_pos.piece_on(to_sq(m)) & 7) == KING)) continue;
 
-                    int cap = root_pos.piece_on(to_sq(m));
-                    int moving_pc = root_pos.piece_on(from_sq(m));
+                    int cap = local_pos.piece_on(to_sq(m));
+                    int moving_pc = local_pos.piece_on(from_sq(m));
                     PieceType moving_pt = PieceType(moving_pc & 7);
-                    Color us = root_pos.side_to_move();
+                    Color us = local_pos.side_to_move();
                     bool was_promotion = promotion_type(m) != NO_PIECE;
                     PieceType prom_pt = promotion_type(m);
-                    int oc = root_pos.castling_rights(), oe = root_pos.ep_sq(), of_ = root_pos.halfmove_clock();
+                    int oc = local_pos.castling_rights(), oe = local_pos.ep_sq(), of_ = local_pos.halfmove_clock();
 
 #ifdef USE_NNUE
                     eval.get_nnue().push();
 #endif
-                    root_pos.make_move(m);
+                    local_pos.make_move(m);
                     stack[0].captured_piece = cap;
                     stack[0].current_move = m;
                     if (was_promotion) moving_pt = prom_pt;
                     int cur_piece_idx = us * 6 + (moving_pt - 1);
                     stack[0].current_piece_idx = cur_piece_idx;
 #ifdef USE_NNUE
-                    eval.get_nnue().make_move(root_pos, m, us, moving_pt, PieceType(cap & 7), was_promotion, prom_pt);
+                    eval.get_nnue().make_move(local_pos, m, us, moving_pt, PieceType(cap & 7), was_promotion, prom_pt);
 #endif
 
-                    if (root_pos.mover_in_check()) {
+                    if (local_pos.mover_in_check()) {
 #ifdef USE_NNUE
                         eval.get_nnue().pop();
 #endif
-                        root_pos.undo_move(m, cap, oc, oe, of_);
+                        local_pos.undo_move(m, cap, oc, oe, of_);
                         continue;
                     }
 
@@ -3649,9 +3662,9 @@ public:
                     pv_len[1] = 0;
                     Value score;
                     if (i == 0 || window_alpha == -INF) {
-                        score = -negamax(root_pos, depth - 1, -beta, -window_alpha, 1, true, NO_MOVE);
+                        score = -negamax(local_pos, depth - 1, -beta, -window_alpha, 1, true, NO_MOVE);
                     } else {
-                        score = -negamax(root_pos, depth - 1, -window_alpha - 1, -window_alpha, 1, true, NO_MOVE);
+                        score = -negamax(local_pos, depth - 1, -window_alpha - 1, -window_alpha, 1, true, NO_MOVE);
                         // Re-search with full window when score >= window_alpha.
                         // The STRICT ">" was a bug: a null-window capped at beta=window_alpha
                         // returns exactly window_alpha (fail-high), which is numerically equal
@@ -3660,13 +3673,13 @@ public:
                         // appear to score exactly window_alpha in the null window but actually
                         // score +MATE in the full window — exactly the case that was broken.
                         if (!stop_search && score >= window_alpha && score < beta)
-                            score = -negamax(root_pos, depth - 1, -beta, -window_alpha, 1, true, NO_MOVE);
+                            score = -negamax(local_pos, depth - 1, -beta, -window_alpha, 1, true, NO_MOVE);
                     }
 
 #ifdef USE_NNUE
                     eval.get_nnue().pop();
 #endif
-                    root_pos.undo_move(m, cap, oc, oe, of_);
+                    local_pos.undo_move(m, cap, oc, oe, of_);
 
                     if (stop_search) break;
 
@@ -3776,7 +3789,7 @@ public:
                                 std::cout << " nodes " << nodes << " nps " << nps_val
                                           << " time " << elapsed_ms << " pv";
                                 // Validate and print PV using move_to_uci for Chess960/promotion correctness
-                                Position pv_tmp = root_pos;
+                                Position pv_tmp = local_pos;
                                 for (Move mv : root_infos[i].pv) {
                                     if (mv == NO_MOVE) break;
                                     Move tmp_list[MAX_MOVES];
@@ -3845,106 +3858,15 @@ public:
         }
 
         if (local_root_moves.empty()) {
-            idle = true;
-            help_search(this);
+            // No root moves assigned to this thread in the current partition.
+            // With Lazy SMP all threads receive the full move list, so this
+            // branch is only hit if a caller explicitly passes an empty list.
+            return;
         }
     }
 
     void search(int max_depth, uint64_t max_nodes) { search(max_depth, max_nodes, {}); }
 };
-
-// ----------------------------------------------------------------------------
-// Global helper functions for work stealing
-// ----------------------------------------------------------------------------
-void help_search(SearchThread* thread) {
-    while (!stop_search) {
-        SplitPoint* sp = nullptr;
-        {
-            std::unique_lock lock(splits_mutex);
-            splits_cv.wait(lock, []{ return !active_splits.empty() || stop_search; });
-            if (stop_search) return;
-            for (auto* s : active_splits) {
-                if (s->next_move < (int)s->moves.size()) {
-                    sp = s;
-                    break;
-                }
-            }
-        }
-        if (sp) help_at_split(thread, sp);
-    }
-}
-
-void help_at_split(SearchThread* thread, SplitPoint* sp) {
-    sp->workers++;
-    while (true) {
-        int idx = sp->next_move.fetch_add(1);
-        if (idx >= (int)sp->moves.size()) break;
-        Move m = sp->moves[idx].move;
-        if (sp->pos->piece_on(to_sq(m)) && ((sp->pos->piece_on(to_sq(m)) & 7) == KING)) continue;
-
-        int captured = sp->pos->piece_on(to_sq(m));
-        int moving_pc = sp->pos->piece_on(from_sq(m));
-#ifdef USE_NNUE
-        PieceType moving_pt = PieceType(moving_pc & 7);
-        Color us = sp->pos->side_to_move();
-        bool was_promotion = promotion_type(m) != NO_PIECE;
-        PieceType prom_pt = promotion_type(m);
-#else
-        (void)moving_pc; (void)captured;
-#endif
-
-        int sp_cap  = sp->pos->piece_on(to_sq(m));
-        int sp_oc   = sp->pos->castling_rights();
-        int sp_oe   = sp->pos->ep_sq();
-        int sp_of   = sp->pos->halfmove_clock();
-#ifdef USE_NNUE
-        thread->get_eval().get_nnue().push();
-#endif
-        sp->pos->make_move(m);
-#ifdef USE_NNUE
-        thread->get_eval().get_nnue().make_move(*sp->pos, m, us, moving_pt, PieceType(captured & 7), was_promotion, prom_pt);
-#endif
-        if (sp->pos->mover_in_check()) {
-#ifdef USE_NNUE
-            thread->get_eval().get_nnue().pop();
-#endif
-            sp->pos->undo_move(m, sp_cap, sp_oc, sp_oe, sp_of);
-            continue;
-        }
-
-        thread->nodes++;
-        Depth new_depth = sp->depth - 1;
-        if (sp->pos->is_check()) new_depth++;
-        thread->pv_len[sp->ply + 1] = 0;
-        Value score = -thread->negamax(*sp->pos, new_depth, -sp->beta, -sp->alpha, sp->ply + 1, sp->cut, NO_MOVE);
-
-#ifdef USE_NNUE
-        thread->get_eval().get_nnue().pop();
-#endif
-        sp->pos->undo_move(m, sp_cap, sp_oc, sp_oe, sp_of);
-
-        {
-            std::lock_guard<std::mutex> lock(sp->mtx);
-            if (score > sp->best_score) {
-                sp->best_score = score;
-                sp->best_move = m;
-                // Copy PV from thread's triangular table into sp->pv
-                int cplen = thread->pv_len[sp->ply+1];
-                sp->pv.clear();
-                sp->pv.push_back(m);
-                for (int _pvi = 0; _pvi < cplen && sp->ply+1+_pvi < MAX_PLY; ++_pvi)
-                    sp->pv.push_back(thread->pv_table[sp->ply+1][_pvi]);
-                if (score > sp->alpha) sp->alpha = score;
-            }
-        }
-    }
-    sp->workers--;
-    if (sp->workers == 0) {
-        std::lock_guard<std::mutex> lock(sp->mtx);
-        sp->finished = true;
-        sp->cv.notify_one();
-    }
-}
 
 // ============================================================================
 // End of Part 3
@@ -4001,6 +3923,7 @@ private:
     int thread_count;
     int multi_pv;
     bool ponder;
+    bool use_book;
     int contempt;
     bool chess960;
     bool uci_limit_strength;
@@ -4025,7 +3948,7 @@ private:
 
 public:
     UCI() : tt(256), search_active(false), pondering_active(false), thread_count(1), multi_pv(1),
-            ponder(false), contempt(0), chess960(false), uci_limit_strength(false), uci_elo(1500),
+            ponder(false), use_book(true), contempt(0), chess960(false), uci_limit_strength(false), uci_elo(1500),
             learning_enabled(false), learning_rate(100), learning_max_adjust(50),
             tuning_mode(false), uci_show_wdl(false),
             skill_level(20),
@@ -4047,7 +3970,7 @@ public:
         } else if (name == "Ponder") {
             ponder = (value == "true");
         } else if (name == "OwnBook") {
-            if (value == "false") book = OpeningBook();
+            use_book = (value != "false");
         } else if (name == "BookFile") {
             if (!value.empty()) book.load(value);
         } else if (name == "BookVariety") {
@@ -4062,9 +3985,17 @@ public:
             syzygy_50_move_rule = (value == "true");
         } else if (name == "Skill Level") {
             skill_level = std::max(0, std::min(20, std::stoi(value)));
-        } else if (name == "EvalFile") {
+        } else if (name == "EvalFile" || name == "NNUEPath") {
 #ifdef USE_NNUE
-            eval.set_nnue(value);
+            if (!value.empty()) {
+                std::string loaded = eval.load_nnue(value);
+                if (!loaded.empty())
+                    std::cout << "info string NNUE loaded: " << loaded << "\n";
+                else
+                    std::cout << "info string NNUE load FAILED"
+                              << " (not a valid .nnue file or no valid .nnue in directory): "
+                              << value << " — falling back to classical eval\n";
+            }
 #endif
         } else if (name == "MultiPV") {
             multi_pv = std::stoi(value);
@@ -4225,7 +4156,13 @@ public:
                 --i;
             }
         }
-        if (!infinite && movetime == 0 && wtime == 0 && btime == 0) infinite = true;
+        // Only force infinite if truly unconstrained: no depth specified (still at default 10),
+        // no nodes, no movetime, no clock — i.e. a bare "go" with no parameters.
+        bool depth_specified = false;
+        for (size_t i = 0; i < args.size(); ++i)
+            if (args[i] == "depth") { depth_specified = true; break; }
+        if (!infinite && !depth_specified && movetime == 0 && wtime == 0 && btime == 0 && nodes == 0)
+            infinite = true;
 
         if (uci_limit_strength && !infinite) {
             int elo_depth = 1 + (uci_elo - 800) / 100;
@@ -4242,9 +4179,10 @@ public:
         tm.set_side(pos.side_to_move(), wtime, btime, winc, binc, movestogo, movetime, infinite, ponder_mode);
         tm.set_game_phase(pos.game_phase());
 
-        if (!ponder_mode && !infinite) {
+        if (!ponder_mode && !infinite && use_book) {
             Move book_move = book.probe(pos);
             if (book_move != NO_MOVE) {
+                std::cout << "info string Book hit — playing book move\n";
                 std::cout << "bestmove " << move_to_uci(book_move, &pos) << std::endl;
                 return;
             }
@@ -4265,6 +4203,11 @@ public:
         depth_continue = false;
         depth_ack_count = 0;
         root_infos.clear();
+
+        // Reset global search state ONCE before any thread launches
+        node_limit = nodes;   // 'nodes' is the go() local parsed from "go nodes N"
+        tb_hits = 0;
+        tt.new_search();   // increment TT generation once per go(), not per thread
 
         Move moves[MAX_MOVES];
         int cnt = generate_moves(pos, moves);
@@ -4315,7 +4258,6 @@ public:
         pondering = ponder_mode;
         pondering_active = ponder_mode;
         search_active = true;
-        threads_idle = false;
 
         // Lazy SMP: every thread receives the FULL root move list and runs an
         // independent iterative-deepening search.  The TT is shared, so threads
@@ -4489,6 +4431,9 @@ public:
                 std::cout << "option name SyzygyProbeLimit type spin default 7 min 0 max 7\n";
                 std::cout << "option name Syzygy50MoveRule type check default true\n";
                 std::cout << "option name EvalFile type string default\n";
+                std::cout << "option name NNUEPath type string default\n";
+                // Note: both EvalFile and NNUEPath accept either a single .nnue file
+                // path or a directory path (scanned alphabetically for .nnue files).
                 std::cout << "option name MultiPV type spin default 1 min 1 max 256\n";
                 std::cout << "option name Contempt type spin default 0 min -100 max 100\n";
                 std::cout << "option name Move Overhead type spin default 10 min 0 max 5000\n";
@@ -4605,6 +4550,8 @@ public:
                 }
                 std::cout << "\n     a b c d e f g h\n\n";
                 std::cout << "FEN  : " << pos.fen() << "\n";
+                std::cout << "Key  : 0x" << std::hex << std::uppercase
+                          << pos.get_hash() << std::dec << "\n";
                 std::cout << "Side : " << (pos.side_to_move() == WHITE ? "White" : "Black") << "\n";
                 std::cout << "EP   : ";
                 if (pos.ep_sq() != -1)

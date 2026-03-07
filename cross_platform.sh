@@ -7,7 +7,7 @@
 #   Variants:
 #     _base      O3, no Syzygy, no NNUE              (always built)
 #     _syzygy    O3, Syzygy/Fathom                   (needs Fathom/)
-#     _nnue      O3, NNUE eval                        (needs *.nnue file)
+#     _nnue      O3, NNUE eval                        (needs ./nnue/ directory)
 #     _full      O3, Syzygy + NNUE                    (needs both)
 #     _chess960  O3, Chess960 debug tracing           (always built)
 #     _debug     O0 -g, assertions on                 (always built)
@@ -56,7 +56,9 @@ SRC="$SCRIPT_DIR/hugine.cpp"
 FATHOM_DIR="$SCRIPT_DIR/Fathom"
 FATHOM_SRC="$FATHOM_DIR/src/tbprobe.c"
 FATHOM_INC="$FATHOM_DIR/src"
-NNUE_FILE="$(ls "$SCRIPT_DIR"/*.nnue "$SCRIPT_DIR"/nn-*.bin 2>/dev/null | head -1 || true)"
+NNUE_DIR=""
+[[ -d "$SCRIPT_DIR/nnue" ]] && NNUE_DIR="$SCRIPT_DIR/nnue"
+NNUE_FILE=""  # individual file path for copying into proot; empty = no nnue
 
 LLVM_VER="20260224"
 LLVM_X86_URL="https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_VER}/llvm-mingw-${LLVM_VER}-ucrt-ubuntu-22.04-x86_64.tar.xz"
@@ -95,8 +97,8 @@ compile() {
     local fobj="${5:-}" opt="${6:--O3 -DNDEBUG}" extra="${7:-}"
     local name; name="$(basename "$out")"
 
-    if echo "$extra" | grep -q "USE_NNUE" && [[ -z "${NNUE_FILE:-}" ]]; then
-        skip "$name  (no .nnue file)"; return
+    if echo "$extra" | grep -q "USE_NNUE" && [[ -z "${NNUE_DIR:-}" ]]; then
+        skip "$name  (no ./nnue/ directory)"; return
     fi
 
     info "  $name ..."
@@ -187,9 +189,9 @@ IS_TERMUX=0
 
 info "Host arch : $HOST_ARCH  |  Termux: $IS_TERMUX"
 [[ -f "$SRC" ]] || die "Source not found: $SRC"
-[[ -n "$NNUE_FILE" ]] \
-    && ok "NNUE     : $NNUE_FILE" \
-    || warn "No .nnue / nn-*.bin — nnue/full variants will be skipped"
+[[ -n "$NNUE_DIR" ]] \
+    && ok "NNUE dir : $NNUE_DIR" \
+    || warn "No ./nnue/ directory found — nnue/full variants will be skipped"
 [[ -f "$FATHOM_SRC" ]] \
     && ok "Fathom   : $FATHOM_SRC" \
     || warn "Fathom not found — syzygy/full variants will be skipped"
@@ -311,7 +313,7 @@ Then rerun this script."
     mkdir -p "$UB_HUGINE"
     cp -u "$SRC" "$UB_HUGINE/"
     [[ -d "$FATHOM_DIR" ]]                   && cp -ru "$FATHOM_DIR"  "$UB_HUGINE/"
-    [[ -n "$NNUE_FILE" && -f "$NNUE_FILE" ]] && cp -u  "$NNUE_FILE"  "$UB_HUGINE/"
+    [[ -n "$NNUE_DIR"  && -d "$NNUE_DIR"  ]] && { mkdir -p "$UB_HUGINE/nnue"; cp -u "$NNUE_DIR"/*.nnue "$UB_HUGINE/nnue/" 2>/dev/null || true; }
     ok "Files synced"
 
     # ------------------------------------------------------------------
@@ -344,7 +346,9 @@ TOOLS="/root/toolchains"
 SRC="$WORK/hugine.cpp"
 FATHOM_SRC="$WORK/Fathom/src/tbprobe.c"
 FATHOM_INC="$WORK/Fathom/src"
-NNUE_FILE="$(ls "$WORK"/*.nnue "$WORK"/nn-*.bin 2>/dev/null | head -1 || true)"
+NNUE_DIR=""
+[[ -d "$WORK/nnue" ]] && NNUE_DIR="$WORK/nnue"
+NNUE_FILE=""  # not used directly — engine uses NNUEPath at runtime
 
 mkdir -p "$BUILD" "$TOOLS"
 
@@ -408,8 +412,8 @@ compile() {
     local fobj="${5:-}" opt="${6:--O3 -DNDEBUG}" extra="${7:-}"
     local name; name="$(basename "$out")"
 
-    if echo "$extra" | grep -q "USE_NNUE" && [[ -z "${NNUE_FILE:-}" ]]; then
-        skip "$name  (no .nnue file)"; return
+    if echo "$extra" | grep -q "USE_NNUE" && [[ -z "${NNUE_DIR:-}" ]]; then
+        skip "$name  (no ./nnue/ directory)"; return
     fi
 
     info "  $name ..."
