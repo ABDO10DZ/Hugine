@@ -1,4 +1,4 @@
-# Hugine 2.0
+# Hugine 5.0
 
 > A UCI chess engine written in C++17 with parallel search, Syzygy endgame tablebases, optional NNUE evaluation, Chess960 support, and an on-disk learning system.
 
