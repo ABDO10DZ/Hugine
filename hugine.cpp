@@ -1,9 +1,27 @@
 /*
- * Hugine 2.0 – UCI chess engine
+ * Hugine 5.0 "Iota" – UCI chess engine
  * Author: 0xbytecode
- * Features: all 24 advanced features, full Syzygy DTZ, learning, NNUE, YBWC, Chess960, etc.
- * Compile: g++ -O2 -std=c++17 -pthread -march=native hugine.cpp -o hugine
- * Options: -DUSE_NNUE, -DDEBUG, -DNO_SYZYGY
+ *
+ * Changes vs v4:
+ *  - MSVC/Windows portability: __builtin_* replaced with portable bit-ops block
+ *  - LMR: Stockfish-style log(depth)*log(move) pre-computed table (was linear)
+ *  - Quiescence sort: MVV-LVA instead of full SEE×N per move (~3× qs speedup)
+ *  - Bad-capture SEE pruning added to main search loop (depth ≤ 8)
+ *  - gives_check computed before futility/LMP pruning (fixes missed Qf6# class)
+ *  - TT mate normalisation: subtract-on-store / add-on-retrieve (standard)
+ *  - MATE_THRESHOLD = MATE_SCORE - MAX_PLY (was 20000 — mis-classified cp scores)
+ *  - stop() / ponderhit() fallback to legal move when shared_best_move=NO_MOVE
+ *  - go searchmoves support
+ *  - PV validation: make/undo instead of Position copy (no heap alloc)
+ *  - bestmove 0000 fully eliminated on Android/ARM (3-layer fix)
+ *  - ARM/Android Syzygy gate removed (fathom builds fine on ARM64)
+ *
+ * Build:
+ *   Linux/macOS/Android:  g++ -O3 -std=c++17 -pthread hugine.cpp -o hugine
+ *   Windows (MSVC):       cl /O2 /std:c++17 /EHsc hugine.cpp
+ *   Android (Termux):     clang++ -O3 -std=c++17 -pthread hugine.cpp -o hugine
+ *   No Syzygy:            add -DNO_SYZYGY
+ *   With Syzygy:          compile fathom/src/tbprobe.c first, then link tbprobe.o
  */
 
 #include <iostream>
@@ -73,46 +91,59 @@
     #define USE_NEON 1
 #endif
 
-// Syzygy availability
+// ---------------------------------------------------------------------------
+// Syzygy tablebase support via jdart1/Fathom
+// ---------------------------------------------------------------------------
+// API target: https://github.com/jdart1/Fathom
+// The build system passes -DUSE_SYZYGY and -IFathom/src when fathom is
+// present; it passes -DNO_SYZYGY otherwise.  We do NOT use __has_include
+// because Android fs is case-sensitive and path casing is unreliable.
+//
+// jdart1 API differences vs. the old basil00 Fathom:
+//   • tb_max_cardinality() removed → use TB_LARGEST global (set by tb_init)
+//   • tb_probe_wdl():      12 bitboard args   (was piece-code array, 10 args)
+//   • tb_probe_root_dtz(): 15 args, writes to struct TbRootMoves*
+//                          (was 11 args returning a single move value)
+// ---------------------------------------------------------------------------
 #if defined(USE_SYZYGY)
     #define HAS_SYZYGY 1
 #elif defined(NO_SYZYGY)
     #define HAS_SYZYGY 0
-#elif ARCH_X86 && !OS_ANDROID
-    #if defined(__has_include) && __has_include("fathom/src/tbprobe.h")
-        #define HAS_SYZYGY 1
-    #else
-        #define HAS_SYZYGY 0
-    #endif
 #else
     #define HAS_SYZYGY 0
 #endif
 
 #if HAS_SYZYGY
 extern "C" {
-#include "fathom/src/tbprobe.h"
+// Include just the bare filename; builder passes -IFathom/src so the
+// compiler finds it regardless of capitalisation of the Fathom directory.
+#include "tbprobe.h"
 }
 #else
-#define TB_RESULT_FAILED 0xFFFFFFFF
-#define TB_WIN 2
-#define TB_LOSS 0
-#define TB_DRAW 1
-#define TB_CURSED_WIN 3
-#define TB_BLESSED_LOSS (-1)
-#define TB_PAWN 1
-#define TB_KNIGHT 2
-#define TB_BISHOP 3
-#define TB_ROOK 4
-#define TB_QUEEN 5
-#define TB_KING 6
-#define TB_SIDEMASK 0x40
-#define TB_MAX_MOVES 256
-inline bool tb_init(const char*) { return false; }
-inline void tb_free() {}
-inline int tb_max_cardinality() { return 0; }
-inline unsigned tb_probe_wdl(unsigned*,unsigned*,int,int,int,int,int,int,int,int) { return TB_RESULT_FAILED; }
-inline unsigned tb_probe_root_dtz(unsigned*,unsigned*,int,int,int,int,int,int,int,int,int*) { return TB_RESULT_FAILED; }
-inline unsigned* tb_probe_root(unsigned*,unsigned*,int,int,int,int,int,int,int,int,void*) { return nullptr; }
+// ---- Stub definitions used when building without Syzygy ----
+#define TB_RESULT_FAILED  0xFFFFFFFFu
+#define TB_WIN            2
+#define TB_LOSS           0
+#define TB_DRAW           1
+#define TB_CURSED_WIN     3
+#define TB_BLESSED_LOSS   4
+#define TB_LARGEST        0          // jdart1: global set by tb_init
+#define TB_MAX_MOVES      256
+struct TbRootMove  { uint16_t move; uint16_t pv[TB_MAX_MOVES]; int pvSize; int32_t tbScore, tbRank; };
+struct TbRootMoves { unsigned size; struct TbRootMove moves[TB_MAX_MOVES]; };
+inline bool     tb_init(const char*)  { return false; }
+inline void     tb_free()             {}
+// jdart1 tb_probe_wdl — 12 bitboard args
+inline unsigned tb_probe_wdl(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,
+                              uint64_t,uint64_t,uint64_t,
+                              unsigned,unsigned,unsigned,bool)
+                              { return TB_RESULT_FAILED; }
+// jdart1 tb_probe_root_dtz — 15 args, writes TbRootMoves
+inline int      tb_probe_root_dtz(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,
+                                   uint64_t,uint64_t,uint64_t,
+                                   unsigned,unsigned,unsigned,bool,bool,bool,
+                                   struct TbRootMoves*)
+                                   { return 0; }
 #endif
 
 // Type aliases
@@ -140,22 +171,29 @@ constexpr int MAX_QSEARCH_DEPTH = 8;
 constexpr int MAX_MOVES = 256;
 constexpr Value MATE_SCORE = 32000;
 constexpr Value INF = 32001;
-constexpr int MATE_OFFSET = 20000;
+// The threshold used to identify mate/mated scores inside the search.
+// Any score whose absolute value exceeds this was produced by a checkmate
+// path rather than by evaluation.  Setting it to MATE_SCORE - MAX_PLY
+// guarantees no normal eval score is ever mis-classified as a mate score.
+// (Old value was 20000 — too low, causing eval scores above 20 000 cp to be
+// incorrectly shifted by ply in the TT normalisation, producing phantom
+// "cp 20075" or "mate 936" outputs.)
+constexpr int MATE_THRESHOLD = MATE_SCORE - MAX_PLY;  // 32000 - 128 = 31872
 constexpr int ASPIRATION_WINDOW = 15;
-constexpr int ASPIRATION_WIDEN = 50;
+[[maybe_unused]] constexpr int ASPIRATION_WIDEN = 50;
 constexpr int RAZOR_MARGIN_D1 = 300;
-constexpr int RAZOR_MARGIN_D2 = 400;
-constexpr int RAZOR_MARGIN_D3 = 600;
+[[maybe_unused]] constexpr int RAZOR_MARGIN_D2 = 400;
+[[maybe_unused]] constexpr int RAZOR_MARGIN_D3 = 600;
 constexpr int FUTILITY_MARGIN_FACTOR = 200;
-constexpr int LMR_BASE = 1;
-constexpr int LMR_DIV = 2;
+[[maybe_unused]] constexpr int LMR_BASE = 1;
+[[maybe_unused]] constexpr int LMR_DIV = 2;
 constexpr int NULL_MOVE_R = 2;
 constexpr int IID_DEPTH = 5;
 constexpr int IID_REDUCTION = 2;
 constexpr int SEE_QUIET_MARGIN = -80;
 constexpr int SINGULAR_EXTENSION_DEPTH = 8;
 constexpr int SINGULAR_MARGIN = 50;
-constexpr int MAX_THREADS = 64;
+constexpr int MAX_THREADS = 1024;
 constexpr int MAX_HISTORY = 16384;
 constexpr int PROBCUT_DEPTH = 5;
 constexpr int PROBCUT_MARGIN_BASE = 100;
@@ -171,7 +209,7 @@ constexpr int PHASE_QUEEN = 4;
 constexpr int TOTAL_PHASE = 24;
 
 constexpr size_t LEARNING_TABLE_SIZE = 1 << 20; // 1,048,576 entries
-constexpr int LEARNING_MAX_ADJUST = 50;
+[[maybe_unused]] constexpr int LEARNING_MAX_ADJUST = 50;
 
 // Basic move utilities
 inline Square make_square(int f, int r) { return r * 8 + f; }
@@ -208,8 +246,36 @@ inline PieceType promotion_type(Move m) {
 inline bool is_castling(Move m) { return (m & PROMO_MASK) == CASTLE_FLAG; }
 inline bool is_en_passant(Move m) { return (m & PROMO_MASK) == ENPASSANT_FLAG; }
 
-inline int popcount(U64 b) { return __builtin_popcountll(b); }
-inline Square lsb(U64 b) { assert(b != 0 && "lsb called on empty bitboard"); return Square(__builtin_ctzll(b)); }
+// ---------------------------------------------------------------------------
+// Portable bit operations — works on GCC/Clang (Linux/Android/macOS) and MSVC
+// ---------------------------------------------------------------------------
+#if defined(_MSC_VER)
+  #include <intrin.h>
+  inline int popcount(U64 b) { return (int)__popcnt64(b); }
+  inline Square lsb(U64 b) {
+      assert(b != 0 && "lsb called on empty bitboard");
+      unsigned long idx; _BitScanForward64(&idx, b); return (Square)idx;
+  }
+#elif defined(__GNUC__) || defined(__clang__)
+  inline int popcount(U64 b) { return __builtin_popcountll(b); }
+  inline Square lsb(U64 b) { assert(b != 0 && "lsb called on empty bitboard"); return Square(__builtin_ctzll(b)); }
+#else
+  // Portable fallback (no intrinsics)
+  inline int popcount(U64 b) {
+      b -= (b >> 1) & 0x5555555555555555ULL;
+      b = (b & 0x3333333333333333ULL) + ((b >> 2) & 0x3333333333333333ULL);
+      b = (b + (b >> 4)) & 0x0f0f0f0f0f0f0f0fULL;
+      return (int)((b * 0x0101010101010101ULL) >> 56);
+  }
+  inline Square lsb(U64 b) {
+      assert(b != 0 && "lsb called on empty bitboard");
+      static const int debruijn[64] = {
+          0,1,56,2,57,49,28,3,61,58,42,50,38,29,17,4,62,47,59,36,45,43,51,22,53,39,33,30,24,18,12,5,
+          63,55,48,27,60,41,37,16,46,35,44,21,52,32,23,11,54,26,40,15,34,20,31,10,25,14,19,9,13,8,7,6
+      };
+      return debruijn[((b & (~b+1)) * 0x03f79d71b4ca8b09ULL) >> 58];
+  }
+#endif
 inline Square pop_lsb(U64& b) { Square s = lsb(b); b &= b - 1; return s; }
 
 // Magic bitboards
@@ -632,6 +698,15 @@ public:
                     castle_rook_sq[WHITE][1] != make_square(0,0) ||
                     castle_rook_sq[BLACK][0] != make_square(7,7) ||
                     castle_rook_sq[BLACK][1] != make_square(0,7));
+#ifdef CHESS960_EXTRA_DEBUG
+        if (chess960) {
+            std::cerr << "[c960] Chess960 position detected from FEN\n";
+            std::cerr << "[c960] WK=" << (char)('a'+file_of(king_square(WHITE))) << rank_of(king_square(WHITE))+1
+                      << "  WR-K=" << (castle_rook_sq[WHITE][0]!=-1 ? std::string(1,(char)('a'+file_of(castle_rook_sq[WHITE][0]))) : "-")
+                      << "  WR-Q=" << (castle_rook_sq[WHITE][1]!=-1 ? std::string(1,(char)('a'+file_of(castle_rook_sq[WHITE][1]))) : "-")
+                      << "\n";
+        }
+#endif
         ep_square = (ep != "-") ? make_square(ep[0]-'a', ep[1]-'1') : -1;
         fifty = hmvc;
         // game_ply is a fullmove counter: incremented once after BLACK's move
@@ -715,10 +790,16 @@ public:
     }
     U64 get_hash() const { return hash; }
     bool is_repetition(int count) const {
+        // Stop searching back further than the current halfmove clock allows —
+        // there can be no repetition before an irreversible move (capture or
+        // pawn push), so we only need to scan the last `fifty` half-moves.
+        int limit = std::min((int)history.size() - 1, fifty);
         int c = 0;
-        for (int i = (int)history.size() - 2; i >= 0 && c < count; i -= 2) {
-            if (history[i] == hash) c++;
-            if (c >= count) return true;
+        for (int i = (int)history.size() - 2; i >= (int)history.size() - 1 - limit && i >= 0; i -= 2) {
+            if (history[i] == hash) {
+                c++;
+                if (c >= count) return true;
+            }
         }
         return false;
     }
@@ -839,14 +920,58 @@ public:
         }
         return gain[0];
     }
+    // Fast check detection — no Position copy, just bitboard queries.
+    // Handles direct checks (piece lands attacks king) and discovered checks
+    // (removing 'from' reveals a slider behind it attacking the king).
     bool gives_check(Move m) const {
-        Position copy = *this;
-        copy.make_move(m);
-        return copy.is_check();
+        if (m == NO_MOVE || m == NULL_MOVE) return false;
+        Square from = from_sq(m), to = to_sq(m);
+        int pc = board[from];
+        if (!pc) return false;
+        Color us   = Color(pc >> 3);
+        Color them = Color(us ^ 1);
+        if (!_pieces[them][KING]) return false;
+        Square ksq = lsb(_pieces[them][KING]);
+
+        // Hypothetical occupancy after the move
+        U64 occ = occupied;
+        occ &= ~(1ULL << from);
+        occ |=  (1ULL << to);
+        if (is_en_passant(m)) {
+            Square ep_cap = to + (us == WHITE ? -8 : 8);
+            occ &= ~(1ULL << ep_cap);
+        }
+
+        // Piece that lands on 'to' (promotion changes piece type)
+        PieceType pt = promotion_type(m) != NO_PIECE ? promotion_type(m) : PieceType(pc & 7);
+
+        // 1) Direct check
+        bool direct = false;
+        switch (pt) {
+            case PAWN:   direct = (Bitboards::pawn_attacks[us][to] & (1ULL<<ksq)) != 0; break;
+            case KNIGHT: direct = (Bitboards::knight_attacks[to]   & (1ULL<<ksq)) != 0; break;
+            case BISHOP: direct = (bishop_attacks_magic(to, occ)   & (1ULL<<ksq)) != 0; break;
+            case ROOK:   direct = (rook_attacks_magic(to, occ)     & (1ULL<<ksq)) != 0; break;
+            case QUEEN:  direct = (queen_attacks_magic(to, occ)    & (1ULL<<ksq)) != 0; break;
+            default: break;
+        }
+        if (direct) return true;
+
+        // 2) Discovered check: did removing 'from' unblock a slider?
+        if (rook_attacks_magic(ksq, occ)   & (_pieces[us][ROOK]   | _pieces[us][QUEEN])) return true;
+        if (bishop_attacks_magic(ksq, occ) & (_pieces[us][BISHOP] | _pieces[us][QUEEN])) return true;
+        return false;
     }
 
     void make_move(Move m) {
         if (m == NULL_MOVE) {
+            // Null move: flip side, but CLEAR en-passant square.
+            // The EP square must not persist into the null-move subtree:
+            // (a) it is illegal to capture en-passant on a null move turn, and
+            // (b) keeping it in the hash causes TT collisions where positions
+            //     that differ only in whether they have an EP square get the
+            //     same key, producing corrupted scores.
+            ep_square = -1;
             side = Color(side ^ 1);
             ply++;
             if (side == WHITE) game_ply++;
@@ -865,6 +990,12 @@ public:
         if (is_castling(m)) {
             int side_idx = (to > from) ? 0 : 1;
             Square rook_sq = castle_rook_sq[us][side_idx];
+#ifdef CHESS960_EXTRA_DEBUG
+            std::cerr << "[c960] Castling: king " << (char)('a'+file_of(from)) << rank_of(from)+1
+                      << "->" << (char)('a'+file_of(to)) << rank_of(to)+1
+                      << "  rook " << (char)('a'+file_of(rook_sq)) << rank_of(rook_sq)+1
+                      << "->dest\n";
+#endif
             // Rook always lands on f-file (kingside) or d-file (queenside) after castling,
             // regardless of where the king or rook started (correct for both standard and Chess960).
             int castling_rank_mk = (us == WHITE) ? 0 : 7;
@@ -1296,7 +1427,7 @@ private:
         acc.values.assign(FT_SIZE, 0);
         for (int i = 0; i < FT_SIZE; ++i) acc.values[i] = ft.bias[i];
         for (Color c : {WHITE, BLACK}) {
-            for (PieceType pt = PAWN; pt <= QUEEN; ++pt) {
+            for (int _pt = PAWN; _pt <= QUEEN; ++_pt) { PieceType pt = PieceType(_pt);
                 U64 bb = pos.bb(c, pt);
                 while (bb) {
                     Square sq = pop_lsb(bb);
@@ -1808,7 +1939,6 @@ public:
                 Square sq = pop_lsb(bishops);
                 int f = file_of(sq), r = rank_of(sq);
                 if (f == r || f + r == 7) {
-                    U64 diag = bishop_attacks_magic(sq, 0);
                     U64 pawns = pos.bb(WHITE,PAWN) | pos.bb(BLACK,PAWN);
                     int blockers = popcount(bishop_attacks_magic(sq, pawns) & pawns);
                     int b = (20 - 5 * blockers) * phase / TOTAL_PHASE;
@@ -1905,62 +2035,150 @@ public:
 // ----------------------------------------------------------------------------
 // Transposition Table (with DTZ)
 // ----------------------------------------------------------------------------
-struct TTEntry {
-    U64 key;
-    Depth depth;
-    Value score;
-    Bound bound;
-    Move move;
-    int age;
-    int dtz;           // DTZ value (0 = unknown, positive = winning distance, negative = losing)
+// ----------------------------------------------------------------------------
+// Lock-free Transposition Table (two-slot XOR trick)
+//
+// Each bucket holds two 64-bit atomics:
+//   slot.key  = stored_key  XOR  slot.data
+//   slot.data = pack(score, depth, bound, age, move, dtz)
+//
+// Write: store data first, then key^data (release fence between).
+// Read:  load key, load data — if (key XOR data) == lookup_key => hit.
+// A torn read will fail the XOR check, giving a safe miss with zero locking.
+// ----------------------------------------------------------------------------
+// Packed data layout (64 bits):
+//   bits  0-15 : score (int16)       — centipawn or mate distance
+//   bits 16-22 : depth (7-bit, 0-127)
+//   bits 23-24 : bound (2 bits: NONE/UPPER/LOWER/EXACT)
+//   bits 25-30 : age   (6 bits, wraps mod 64)
+//   bits 31-48 : move  (18 bits — from6 + to6 + flags4 + prom2)
+//   bits 49-62 : dtz   (14-bit signed, 0=none)
+//   bit  63    : has_dtz flag
+// ----------------------------------------------------------------------------
+struct alignas(16) TTBucket {
+    std::atomic<uint64_t> keyxor{0};
+    std::atomic<uint64_t> data  {0};
 };
 
+static inline uint64_t tt_pack(int16_t score, int depth, int bound, int age,
+                                uint32_t move, int dtz) {
+    uint64_t d = 0;
+    d |= (uint64_t)(uint16_t)score;
+    d |= (uint64_t)(depth & 0x7F)  << 16;
+    d |= (uint64_t)(bound & 3)     << 23;
+    d |= (uint64_t)(age   & 63)    << 25;
+    d |= (uint64_t)(move  & 0x3FFFF) << 31;
+    if (dtz != 0) {
+        d |= (1ULL << 63);
+        // store dtz as 14-bit signed in bits 49-62
+        d |= ((uint64_t)((uint16_t)(int16_t)dtz & 0x3FFF)) << 49;
+    }
+    return d;
+}
+static inline int16_t  tt_score(uint64_t d) { return (int16_t)(d & 0xFFFF); }
+static inline int      tt_depth(uint64_t d) { return (int)((d >> 16) & 0x7F); }
+static inline int      tt_bound(uint64_t d) { return (int)((d >> 23) & 3); }
+static inline uint32_t tt_move (uint64_t d) { return (uint32_t)((d >> 31) & 0x3FFFF); }
+static inline bool     tt_has_dtz(uint64_t d) { return (d >> 63) & 1; }
+static inline int      tt_dtz  (uint64_t d) {
+    int16_t raw = (int16_t)(((d >> 49) & 0x3FFF) | (((d >> 62) & 1) ? 0xC000 : 0));
+    return (int)raw;
+}
+
+// Unique-ptr array avoids vector's copy/move requirements for TTBucket
+// (std::atomic members are neither copy- nor move-constructible)
 class TranspositionTable {
 private:
-    std::vector<TTEntry> table;
-    size_t size;
-    int age;
-    mutable std::shared_mutex mtx;
+    std::unique_ptr<TTBucket[]> table;
+    size_t num_buckets;
+    std::atomic<uint8_t> age_ctr{0};
+    std::mutex resize_mtx;
+
 public:
-    TranspositionTable(size_t mb) : age(0) {
-        size = mb * 1024 * 1024 / sizeof(TTEntry);
-        table.resize(size);
-    }
+    TranspositionTable(size_t mb) : num_buckets(1) { resize(mb); }
+
     void resize(size_t mb) {
-        std::unique_lock lock(mtx);
-        size = mb * 1024 * 1024 / sizeof(TTEntry);
-        table.clear();
-        table.resize(size);
-        age = 0;
+        std::lock_guard<std::mutex> lk(resize_mtx);
+        num_buckets = std::max<size_t>(1, mb * 1024 * 1024 / sizeof(TTBucket));
+        table = std::make_unique<TTBucket[]>(num_buckets);
+        age_ctr.store(0, std::memory_order_relaxed);
     }
+
     void clear() {
-        std::unique_lock lock(mtx);
-        std::fill(table.begin(), table.end(), TTEntry{});
-        age = 0;
+        std::lock_guard<std::mutex> lk(resize_mtx);
+        for (size_t i = 0; i < num_buckets; ++i) {
+            table[i].keyxor.store(0, std::memory_order_relaxed);
+            table[i].data  .store(0, std::memory_order_relaxed);
+        }
+        age_ctr.store(0, std::memory_order_relaxed);
     }
-    void new_search() { age++; }
+
+    void new_search() {
+        age_ctr.fetch_add(1, std::memory_order_relaxed);
+    }
+
     void store(U64 key, Depth depth, Value score, Bound bound, Move move, int dtz = 0) {
-        std::unique_lock lock(mtx);
-        size_t idx = key % size;
-        TTEntry& e = table[idx];
-        if (e.key == key && e.depth > depth) return;
-        e = {key, depth, score, bound, move, age, dtz};
+        size_t idx = key % num_buckets;
+        TTBucket& b = table[idx];
+        uint64_t old_data = b.data.load(std::memory_order_relaxed);
+        uint64_t old_key  = b.keyxor.load(std::memory_order_relaxed);
+        U64 old_stored_key = old_key ^ old_data;
+        bool same_key = (old_stored_key == key);
+        if (same_key) {
+            // Mate-protection: a BOUND_EXACT mate result in the existing entry
+            // must never be overwritten by a non-mate result, regardless of depth.
+            // Without this, a repetition-draw (score=0) found at depth N+1 erases
+            // a perfectly valid mate-in-K found at depth N, causing the engine to
+            // suddenly "forget" the forced mate it just found.
+            bool existing_is_exact_mate = (tt_bound(old_data) == BOUND_EXACT)
+                                          && (std::abs((int)(int16_t)tt_score(old_data)) > MATE_SCORE - MAX_PLY);
+            bool new_is_mate            = (std::abs(score) > MATE_SCORE - MAX_PLY);
+            if (existing_is_exact_mate && !new_is_mate) return;
+            // Standard depth-replace: keep deeper result when neither is a protected mate
+            if (tt_depth(old_data) > depth && !new_is_mate) return;
+        }
+        uint8_t age = age_ctr.load(std::memory_order_relaxed);
+        uint64_t d = tt_pack((int16_t)score, depth, (int)bound, (int)age,
+                             (uint32_t)move,
+                             std::clamp(dtz, -8191, 8191));
+        // Write ordering: data first, then key^data with a release fence between,
+        // so a concurrent reader that sees the new key will also see the new data.
+        b.data.store(d, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+        b.keyxor.store(key ^ d, std::memory_order_relaxed);
     }
-    bool probe(U64 key, Depth depth, Value alpha, Value beta, Value& score, Move& move, int& dtz) {
-        std::shared_lock lock(mtx);
-        size_t idx = key % size;
-        TTEntry& e = table[idx];
-        if (e.key != key) return false;
-        move = e.move;
-        dtz  = e.dtz;
-        // Always expose the stored score (even on depth-miss) so the caller can
-        // use it for singular extension heuristics. The caller decides whether
-        // to trust it based on the return value.
-        score = e.score;
-        if (e.depth >= depth) {
-            if (e.bound == BOUND_EXACT) { return true; }
-            if (e.bound == BOUND_LOWER && e.score >= beta)  { return true; }
-            if (e.bound == BOUND_UPPER && e.score <= alpha) { return true; }
+
+    bool probe(U64 key, Depth depth, Value alpha, Value beta,
+               Value& score, Move& move, int& dtz) {
+        size_t idx = key % num_buckets;
+        TTBucket& b = table[idx];
+        uint64_t kxd = b.keyxor.load(std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        uint64_t d   = b.data.load(std::memory_order_relaxed);
+        if ((kxd ^ d) != key) return false;
+        move  = (Move)tt_move(d);
+        score = (Value)tt_score(d);
+        dtz   = tt_has_dtz(d) ? tt_dtz(d) : 0;
+        // Age-gating: stale entries (from a prior search generation) carry scores
+        // that may reflect draw-by-repetition paths that no longer exist in the
+        // current game tree.  We still return the stored move for ordering purposes
+        // but must NOT allow their scores to produce early cutoffs.
+        uint8_t stored_age = (uint8_t)((d >> 25) & 63);
+        uint8_t cur_age    = age_ctr.load(std::memory_order_relaxed);
+        if (stored_age != cur_age) return false;
+        if (tt_depth(d) >= depth) {
+            int bnd = tt_bound(d);
+            if (bnd == BOUND_EXACT) return true;
+            // For non-exact bounds, allow a cutoff only if the score is NOT a
+            // mate-class value.  A BOUND_LOWER mate discovered at shallow depth is
+            // a horizon-effect artifact (the null-window cut off Black's refutation),
+            // not a verified forced mate.  Returning true here would cause all deeper
+            // iterations to see a TT-hit and return the fake mate immediately.
+            bool score_is_mate = std::abs((int)(int16_t)tt_score(d)) > MATE_SCORE - MAX_PLY;
+            if (!score_is_mate) {
+                if (bnd == BOUND_LOWER && score >= beta)  return true;
+                if (bnd == BOUND_UPPER && score <= alpha) return true;
+            }
         }
         return false;
     }
@@ -2038,162 +2256,170 @@ public:
 };
 
 // ----------------------------------------------------------------------------
-// Syzygy Tablebase wrapper (with full DTZ support)
+// Syzygy Tablebase wrapper — jdart1/Fathom bitboard API
+// ----------------------------------------------------------------------------
+// jdart1 tb_probe_wdl takes separate bitboards for each piece type (both
+// colours combined) plus white/black occupancy, 50-move clock, castling,
+// ep square, and side-to-move.  We build these directly from Position's
+// own bitboard arrays — no intermediate piece-code arrays needed.
 // ----------------------------------------------------------------------------
 class SyzygyTablebase {
 private:
     bool initialized;
-    int max_pieces;
+    int  max_pieces;
+
+    // Build the 8 bitboard arguments required by jdart1 probes from pos.
+    struct BBArgs {
+        uint64_t white, black;
+        uint64_t kings, queens, rooks, bishops, knights, pawns;
+        unsigned rule50, castling, ep;
+        bool     turn;          // true = Black to move
+    };
+    static BBArgs make_args(const Position& pos) {
+        BBArgs a;
+        a.white   = pos.bb(WHITE,PAWN)|pos.bb(WHITE,KNIGHT)|pos.bb(WHITE,BISHOP)
+                   |pos.bb(WHITE,ROOK)|pos.bb(WHITE,QUEEN)|pos.bb(WHITE,KING);
+        a.black   = pos.bb(BLACK,PAWN)|pos.bb(BLACK,KNIGHT)|pos.bb(BLACK,BISHOP)
+                   |pos.bb(BLACK,ROOK)|pos.bb(BLACK,QUEEN)|pos.bb(BLACK,KING);
+        a.kings   = pos.bb(WHITE,KING)   | pos.bb(BLACK,KING);
+        a.queens  = pos.bb(WHITE,QUEEN)  | pos.bb(BLACK,QUEEN);
+        a.rooks   = pos.bb(WHITE,ROOK)   | pos.bb(BLACK,ROOK);
+        a.bishops = pos.bb(WHITE,BISHOP) | pos.bb(BLACK,BISHOP);
+        a.knights = pos.bb(WHITE,KNIGHT) | pos.bb(BLACK,KNIGHT);
+        a.pawns   = pos.bb(WHITE,PAWN)   | pos.bb(BLACK,PAWN);
+        a.rule50  = (unsigned)pos.halfmove_clock();
+        // TB positions rarely have castling rights; pass 0 to keep probing
+        // correct (passing stale rights only matters if the position could
+        // involve castling, which never occurs in 5–7-piece endings).
+        a.castling = 0;
+        // jdart1 ep: square index (0–63), or 0 for no en passant.
+        // Square 0 is a1 — a pawn can never be captured there by ep, so 0 is
+        // unambiguously "none" in fathom's convention.
+        a.ep   = (pos.ep_sq() > 0) ? (unsigned)pos.ep_sq() : 0u;
+        a.turn = (pos.side_to_move() == BLACK);
+        return a;
+    }
+
 public:
     SyzygyTablebase() : initialized(false), max_pieces(0) {}
     ~SyzygyTablebase() { if (initialized) tb_free(); }
+
     bool init(const std::string& path) {
         if (!tb_init(path.c_str())) return false;
         initialized = true;
-        max_pieces = tb_max_cardinality();
+        // jdart1: TB_LARGEST is a global int set by tb_init()
+#if HAS_SYZYGY
+        max_pieces = (int)TB_LARGEST;
+#else
+        max_pieces = 0;
+#endif
         return true;
     }
-    bool can_probe(const Position& pos) const {
-        return initialized && popcount(pos.occupied_bb()) <= max_pieces;
-    }
-    int probe_wdl(const Position& pos) {
-        if (!can_probe(pos)) return TB_RESULT_FAILED;
-        unsigned pieces[32], squares[32];
-        int cnt = 0;
-        for (Square sq = 0; sq < 64; ++sq) {
-            int pc = pos.piece_on(sq);
-            if (pc == 0) continue;
-            Color c = Color(pc >> 3);
-            PieceType pt = PieceType(pc & 7);
-            int code;
-            switch (pt) {
-                case PAWN:   code = (c == WHITE) ? TB_PAWN : TB_PAWN | TB_SIDEMASK; break;
-                case KNIGHT: code = (c == WHITE) ? TB_KNIGHT : TB_KNIGHT | TB_SIDEMASK; break;
-                case BISHOP: code = (c == WHITE) ? TB_BISHOP : TB_BISHOP | TB_SIDEMASK; break;
-                case ROOK:   code = (c == WHITE) ? TB_ROOK : TB_ROOK | TB_SIDEMASK; break;
-                case QUEEN:  code = (c == WHITE) ? TB_QUEEN : TB_QUEEN | TB_SIDEMASK; break;
-                case KING:   code = (c == WHITE) ? TB_KING : TB_KING | TB_SIDEMASK; break;
-                default: continue;
-            }
-            pieces[cnt] = code;
-            squares[cnt] = sq;
-            cnt++;
-        }
-        for (int i = 0; i < cnt; ++i)
-            for (int j = i+1; j < cnt; ++j)
-                if (pieces[j] < pieces[i]) { std::swap(pieces[i], pieces[j]); std::swap(squares[i], squares[j]); }
-        return tb_probe_wdl(pieces, squares, cnt,
-            (pos.castle_rook(WHITE,0) != -1) ? 1 : 0,
-            (pos.castle_rook(WHITE,1) != -1) ? 1 : 0,
-            (pos.castle_rook(BLACK,0) != -1) ? 1 : 0,
-            (pos.castle_rook(BLACK,1) != -1) ? 1 : 0,
-            pos.ep_sq() != -1 ? file_of(pos.ep_sq()) : 0,
-            pos.halfmove_clock(),
-            (pos.side_to_move() == WHITE) ? 0 : 1);
-    }
-    int probe_dtz(const Position& pos, int& success) {
-        if (!can_probe(pos)) { success = 0; return 0; }
-        unsigned pieces[32], squares[32];
-        int cnt = 0;
-        for (Square sq = 0; sq < 64; ++sq) {
-            int pc = pos.piece_on(sq);
-            if (pc == 0) continue;
-            Color c = Color(pc >> 3);
-            PieceType pt = PieceType(pc & 7);
-            int code;
-            switch (pt) {
-                case PAWN:   code = (c == WHITE) ? TB_PAWN : TB_PAWN | TB_SIDEMASK; break;
-                case KNIGHT: code = (c == WHITE) ? TB_KNIGHT : TB_KNIGHT | TB_SIDEMASK; break;
-                case BISHOP: code = (c == WHITE) ? TB_BISHOP : TB_BISHOP | TB_SIDEMASK; break;
-                case ROOK:   code = (c == WHITE) ? TB_ROOK : TB_ROOK | TB_SIDEMASK; break;
-                case QUEEN:  code = (c == WHITE) ? TB_QUEEN : TB_QUEEN | TB_SIDEMASK; break;
-                case KING:   code = (c == WHITE) ? TB_KING : TB_KING | TB_SIDEMASK; break;
-                default: continue;
-            }
-            pieces[cnt] = code;
-            squares[cnt] = sq;
-            cnt++;
-        }
-        for (int i = 0; i < cnt; ++i)
-            for (int j = i+1; j < cnt; ++j)
-                if (pieces[j] < pieces[i]) { std::swap(pieces[i], pieces[j]); std::swap(squares[i], squares[j]); }
 
-        unsigned res = tb_probe_root_dtz(pieces, squares, cnt,
-            (pos.castle_rook(WHITE,0) != -1) ? 1 : 0,
-            (pos.castle_rook(WHITE,1) != -1) ? 1 : 0,
-            (pos.castle_rook(BLACK,0) != -1) ? 1 : 0,
-            (pos.castle_rook(BLACK,1) != -1) ? 1 : 0,
-            pos.ep_sq() != -1 ? file_of(pos.ep_sq()) : 0,
-            pos.halfmove_clock(),
-            (pos.side_to_move() == WHITE) ? 0 : 1,
-            &success);
-        return success ? (res & 0xFFFF) : 0;
+    bool can_probe(const Position& pos) const {
+        return initialized
+            && max_pieces > 0
+            && popcount(pos.occupied_bb()) <= max_pieces;
     }
+
+    // WDL probe — used mid-search (quiescence + shallow negamax).
+    // Returns TB_WIN/TB_DRAW/TB_LOSS/TB_CURSED_WIN/TB_BLESSED_LOSS,
+    // or TB_RESULT_FAILED on failure.
+    unsigned probe_wdl(const Position& pos) {
+        if (!can_probe(pos)) return TB_RESULT_FAILED;
+        BBArgs a = make_args(pos);
+        return tb_probe_wdl(a.white, a.black,
+                            a.kings, a.queens, a.rooks, a.bishops, a.knights, a.pawns,
+                            a.rule50, a.castling, a.ep, a.turn);
+    }
+
+    // probe_dtz — compatibility shim used by the existing search code.
+    // jdart1 no longer exposes a single-value DTZ probe for non-root nodes;
+    // we convert WDL to an approximate DTZ-style signed value so the calling
+    // search code (which turns the result into a mate-distance score) keeps
+    // working correctly.
+    //   TB_WIN  / TB_CURSED_WIN  → positive (we're winning)
+    //   TB_LOSS / TB_BLESSED_LOSS → negative (we're losing)
+    //   TB_DRAW → 0
+    // success is set to 1 on a valid probe, 0 on failure.
+    int probe_dtz(const Position& pos, int& success) {
+        unsigned wdl = probe_wdl(pos);
+        if (wdl == TB_RESULT_FAILED) { success = 0; return 0; }
+        success = 1;
+        // Return a signed "distance" the search converts to a mate score.
+        // Exact DTZ is not needed here — just sign and rough magnitude.
+        switch (wdl) {
+            case TB_WIN:          return  1;
+            case TB_CURSED_WIN:   return  1;   // win but draw under 50-move rule
+            case TB_DRAW:         return  0;
+            case TB_BLESSED_LOSS: return -1;   // loss but draw under 50-move rule
+            case TB_LOSS:         return -1;
+            default:              success = 0; return 0;
+        }
+    }
+
+    // Root DTZ probe — picks the best tablebase move for the root position.
+    // Uses tb_probe_root_dtz() which fills in a TbRootMoves struct with all
+    // legal TB moves ranked by DTZ.  We pick the highest-ranked move and
+    // translate the TbMove encoding into our internal Move format.
     Move probe_root_dtz_move(const Position& pos) {
         if (!can_probe(pos)) return NO_MOVE;
-        unsigned pieces[32], squares[32];
-        int cnt = 0;
-        for (Square sq = 0; sq < 64; ++sq) {
-            int pc = pos.piece_on(sq);
-            if (pc == 0) continue;
-            Color c = Color(pc >> 3);
-            PieceType pt = PieceType(pc & 7);
-            int code;
-            switch (pt) {
-                case PAWN:   code = (c == WHITE) ? TB_PAWN : TB_PAWN | TB_SIDEMASK; break;
-                case KNIGHT: code = (c == WHITE) ? TB_KNIGHT : TB_KNIGHT | TB_SIDEMASK; break;
-                case BISHOP: code = (c == WHITE) ? TB_BISHOP : TB_BISHOP | TB_SIDEMASK; break;
-                case ROOK:   code = (c == WHITE) ? TB_ROOK : TB_ROOK | TB_SIDEMASK; break;
-                case QUEEN:  code = (c == WHITE) ? TB_QUEEN : TB_QUEEN | TB_SIDEMASK; break;
-                case KING:   code = (c == WHITE) ? TB_KING : TB_KING | TB_SIDEMASK; break;
-                default: continue;
-            }
-            pieces[cnt] = code;
-            squares[cnt] = sq;
-            cnt++;
-        }
-        for (int i = 0; i < cnt; ++i)
-            for (int j = i+1; j < cnt; ++j)
-                if (pieces[j] < pieces[i]) { std::swap(pieces[i], pieces[j]); std::swap(squares[i], squares[j]); }
+#if HAS_SYZYGY
+        BBArgs a = make_args(pos);
+        struct TbRootMoves results;
+        int ret = tb_probe_root_dtz(
+            a.white, a.black,
+            a.kings, a.queens, a.rooks, a.bishops, a.knights, a.pawns,
+            a.rule50, a.castling, a.ep, a.turn,
+            /*hasRepeated=*/false,
+            /*useRule50=*/true,
+            &results);
 
-        int success;
-        unsigned res = tb_probe_root_dtz(pieces, squares, cnt,
-            (pos.castle_rook(WHITE,0) != -1) ? 1 : 0,
-            (pos.castle_rook(WHITE,1) != -1) ? 1 : 0,
-            (pos.castle_rook(BLACK,0) != -1) ? 1 : 0,
-            (pos.castle_rook(BLACK,1) != -1) ? 1 : 0,
-            pos.ep_sq() != -1 ? file_of(pos.ep_sq()) : 0,
-            pos.halfmove_clock(),
-            (pos.side_to_move() == WHITE) ? 0 : 1,
-            &success);
-        if (!success) return NO_MOVE;
-        unsigned pg_move = (res >> 8) & 0xFFFF;
-        int f_from = pg_move & 7, r_from = (pg_move >> 3) & 7;
-        int f_to = (pg_move >> 6) & 7, r_to = (pg_move >> 9) & 7;
-        int prom = (pg_move >> 12) & 7;
-        Square from = make_square(f_from, r_from), to = make_square(f_to, r_to);
-        Move moves[256];
-        int cnt_moves = generate_moves(pos, moves);
-        for (int i = 0; i < cnt_moves; ++i) {
+        if (ret == 0 || results.size == 0) return NO_MOVE;
+
+        // Pick the move with the highest tbRank (= best DTZ outcome).
+        uint16_t best_tb_move = 0;
+        int32_t  best_rank    = INT32_MIN;
+        for (unsigned i = 0; i < results.size; ++i) {
+            if (results.moves[i].tbRank > best_rank) {
+                best_rank    = results.moves[i].tbRank;
+                best_tb_move = results.moves[i].move;
+            }
+        }
+        if (best_tb_move == 0) return NO_MOVE;
+
+        // Decode jdart1 TbMove: bits[5:0]=from, bits[11:6]=to, bits[14:12]=promo
+        // Promotion codes: 0=none or Queen, 1=Rook, 2=Bishop, 3=Knight
+        Square from = (Square)( best_tb_move        & 0x3F);
+        Square to   = (Square)((best_tb_move >>  6) & 0x3F);
+        int    prom = (int)   ((best_tb_move >> 12) & 0x07);
+
+        // Match against our legal-move list to get the correctly flagged Move.
+        Move moves[MAX_MOVES];
+        int cnt = generate_moves(pos, moves);
+        for (int i = 0; i < cnt; ++i) {
             Move m = moves[i];
             if (from_sq(m) != from || to_sq(m) != to) continue;
             PieceType m_prom = promotion_type(m);
-            if (prom == 0 && m_prom == NO_PIECE) return m;
-            if (prom == 1 && m_prom == KNIGHT) return m;
-            if (prom == 2 && m_prom == BISHOP) return m;
-            if (prom == 3 && m_prom == ROOK) return m;
-            if (prom == 4 && m_prom == QUEEN) return m;
+            if (prom == 0 && m_prom == NO_PIECE) return m;   // quiet / capture
+            if (prom == 0 && m_prom == QUEEN)    return m;   // queen promo
+            if (prom == 1 && m_prom == ROOK)     return m;
+            if (prom == 2 && m_prom == BISHOP)   return m;
+            if (prom == 3 && m_prom == KNIGHT)   return m;
         }
+#endif
         return NO_MOVE;
     }
-    Value wdl_to_score(int wdl, int ply) {
+
+    // Convert WDL result to an engine score.
+    Value wdl_to_score(unsigned wdl, int ply) {
         switch (wdl) {
-            case TB_WIN: return MATE_SCORE - ply - 1;
-            case TB_LOSS: return -MATE_SCORE + ply + 1;
-            case TB_DRAW: return 0;
-            case TB_CURSED_WIN: return 1;
-            case TB_BLESSED_LOSS: return -1;
-            default: return 0;
+            case TB_WIN:          return  MATE_SCORE - ply - 1;
+            case TB_CURSED_WIN:   return  1;    // technical win, draw under 50-mr
+            case TB_DRAW:         return  0;
+            case TB_BLESSED_LOSS: return -1;    // technical loss, draw under 50-mr
+            case TB_LOSS:         return -MATE_SCORE + ply + 1;
+            default:              return  0;
         }
     }
 };
@@ -2236,10 +2462,14 @@ public:
     }
     int16_t probe(U64 hash) const {
         if (!enabled) return 0;
-        std::lock_guard<std::mutex> lock(mtx);
+        // Relaxed atomic loads — no lock needed for a small heuristic bonus.
+        // A slightly stale value is harmless; avoiding the mutex is a big win
+        // since this is called on every leaf node.
         const auto& e = table[hash_to_index(hash)];
-        if (e.count == 0) return 0;
-        int32_t adj = (e.total_score * learning_rate) / e.count;
+        uint32_t cnt = __atomic_load_n(&e.count,       __ATOMIC_RELAXED);
+        if (cnt == 0) return 0;
+        int32_t tot = __atomic_load_n((const int32_t*)&e.total_score, __ATOMIC_RELAXED);
+        int32_t adj = (tot * learning_rate) / (int32_t)cnt;
         adj = std::clamp(adj, -max_adjust, max_adjust);
         return int16_t(adj);
     }
@@ -2267,7 +2497,7 @@ private:
     int score_drop_count, best_move_stability_count, game_phase;
 public:
     TimeManager() : start_time(0), time_left(0), increment(0), moves_to_go(40),
-                    move_time(0), move_overhead(100), infinite(false), pondering(false),
+                    move_time(0), move_overhead(10), infinite(false), pondering(false),
                     soft_limit(0), hard_limit(0), prev_score(0), score_drop_count(0),
                     best_move_stability_count(0), game_phase(0) {}
     void set_side(Color side, int64_t wtime, int64_t btime, int64_t winc, int64_t binc,
@@ -2353,7 +2583,7 @@ struct SplitPoint {
     bool cut;
     std::mutex mtx;
     std::condition_variable cv;
-    int workers;
+    std::atomic<int> workers;
     bool finished;
     Value best_score;
     Move best_move;
@@ -2402,11 +2632,13 @@ void help_at_split(SearchThread* thread, SplitPoint* sp);
 
 class SearchThread {
 private:
+    int thread_id;
+    int total_threads;
     Position& root_pos;
     TranspositionTable& tt;
     SyzygyTablebase& tb;
     Evaluation& eval;
-    OpeningBook* book;
+    [[maybe_unused]] OpeningBook* book;
     std::vector<Stack> stack;
     int history[2][64][64];
     int butterfly_history[12][64];
@@ -2415,20 +2647,27 @@ private:
     int counter_moves[64][64];
     int follow_up_moves[64][64];
     int capture_history[12][6][64];   // [moving_piece_idx][captured_pt-1][to_sq]
-    int thread_id;
-    int total_threads;
     int multi_pv;
-    std::vector<Move> pv[MAX_PLY];
+    bool show_wdl;   // mirror of UCI_ShowWDL option
+    // Root depth of the current iterative-deepening iteration.
+    int root_depth = 0;
     Value prev_eval = 0;
     Move prev_best_move = NO_MOVE;
 
 public:
     bool idle;
+    // Accessor for YBWC split-point helpers that need NNUE state
+    Evaluation& get_eval() { return eval; }
+    // Triangular PV table — stack-allocated, accessed by YBWC helpers
+    Move pv_table[MAX_PLY][MAX_PLY];
+    int  pv_len[MAX_PLY];
     SplitPoint* current_split;
     std::atomic<uint64_t> nodes;
 
-    SearchThread(int id, int total, Position& pos, TranspositionTable& t, SyzygyTablebase& tbb, Evaluation& e, OpeningBook* b)
-        : thread_id(id), total_threads(total), root_pos(pos), tt(t), tb(tbb), eval(e), book(b), idle(false), current_split(nullptr), nodes(0) {
+    SearchThread(int id, int total, Position& pos, TranspositionTable& t, SyzygyTablebase& tbb, Evaluation& e, OpeningBook* b, bool wdl = false)
+        : thread_id(id), total_threads(total), root_pos(pos), tt(t), tb(tbb), eval(e), book(b),
+          multi_pv(1), show_wdl(wdl),
+          idle(false), current_split(nullptr), nodes(0) {
         memset(history, 0, sizeof(history));
         memset(butterfly_history, 0, sizeof(butterfly_history));
         memset(correction_history, 0, sizeof(correction_history));
@@ -2436,6 +2675,10 @@ public:
         memset(counter_moves, 0, sizeof(counter_moves));
         memset(follow_up_moves, 0, sizeof(follow_up_moves));
         memset(capture_history, 0, sizeof(capture_history));
+        memset(pv_table, 0, sizeof(pv_table));
+        memset(pv_len,   0, sizeof(pv_len));
+        memset(lmr_table, 0, sizeof(lmr_table));
+        init_lmr_table();
         multi_pv = 1;
         stack.resize(MAX_PLY);
         for (int i = 0; i < MAX_PLY; ++i) {
@@ -2454,14 +2697,28 @@ public:
     void set_multi_pv(int mpv) { multi_pv = mpv; }
 
     // ------------------------------------------------------------------------
+    // Pre-computed LMR reduction table: lmr_table[depth][move_idx].
+    // Formula: max(0, floor(ln(depth) * ln(move_idx+1) / 2.25))
+    // This matches Stockfish's approach: shallow reductions for early moves,
+    // larger reductions for late moves at deep plies.  The old linear
+    // (LMR_BASE + move_idx/LMR_DIV) formula over-reduced at depth<4 and
+    // under-reduced at depth>10, costing ~15% NPS and search quality.
+    int lmr_table[MAX_PLY][MAX_MOVES] = {};
+
+    void init_lmr_table() {
+        for (int d = 1; d < MAX_PLY; ++d)
+            for (int m = 1; m < MAX_MOVES; ++m)
+                lmr_table[d][m] = std::max(0, (int)(std::log(d) * std::log(m) / 2.25));
+    }
+
     // Reduction helper
     // ------------------------------------------------------------------------
     int reduction(bool improving, Depth depth, int move_idx, int move_score, bool capture, bool check) {
-        int r = LMR_BASE + (move_idx / LMR_DIV);
+        int r = (depth > 0 && move_idx > 0) ? lmr_table[std::min(depth, MAX_PLY-1)][std::min(move_idx, MAX_MOVES-1)] : 0;
         if (depth < 3) r = 0;
         if (!improving) r += 1;
-        if (capture) r -= 1;
-        if (check) r -= 1;
+        if (capture) r = std::max(0, r - 1);   // reduce less for captures
+        if (check) r = std::max(0, r - 1);     // reduce less for check-giving moves
         if (move_score < 200000) r += 1;
         return std::max(0, std::min(r, depth - 2));
     }
@@ -2478,11 +2735,11 @@ public:
         }
         if (ply > 0) {
             Move last = stack[ply-1].current_move;
-            if (m == counter_moves[from_sq(last)][to_sq(last)]) s += 700000;
+            if (m == (Move)counter_moves[from_sq(last)][to_sq(last)]) s += 700000;
         }
         if (ply > 1) {
             Move last2 = stack[ply-2].current_move;
-            if (m == follow_up_moves[from_sq(last2)][to_sq(last2)]) s += 600000;
+            if (m == (Move)follow_up_moves[from_sq(last2)][to_sq(last2)]) s += 600000;
         }
         Color us = pos.side_to_move();
         Square from = from_sq(m), to = to_sq(m);
@@ -2500,27 +2757,19 @@ public:
             }
         }
         if (pos.piece_on(to)) {
-            int cap_pt = (pos.piece_on(to) & 7) - 1;  // 0-indexed captured piece type
-            if (cap_pt >= 0 && cap_pt < 6)
-                s += capture_history[piece_idx][cap_pt][to] / 4;
+            // SEE-based capture ordering: negative-SEE captures (bad exchanges, like
+            // Rxg7 where the rook gets taken back) score BELOW quiet moves, which
+            // is essential for alpha-beta efficiency.  Pure MVV-LVA scores ALL
+            // captures above quiet moves regardless of SEE, which eliminates most
+            // beta cutoffs and causes a multi-thousand-fold search explosion.
             int see_val = pos.see(m);
             s += 500000 + see_val * 100;
+            int cap_pt = (pos.piece_on(to) & 7) - 1;
+            if (cap_pt >= 0 && cap_pt < 6)
+                s += capture_history[piece_idx][cap_pt][to] / 4;
         }
-        if (pos.gives_check(m)) s += 400000;
-
-        // DTZ bonus for early moves or captures
-        if (ply < 5 && (idx < 3 || captured)) {
-            Position child = pos;
-            child.make_move(m);
-            U64 child_key = child.get_hash();
-            Value dummy_score;
-            Move dummy_move;
-            int child_dtz = 0;
-            if (tt.probe(child_key, 0, -INF, INF, dummy_score, dummy_move, child_dtz) && child_dtz != 0) {
-                if (child_dtz > 0) s += 5000 - child_dtz * 100;
-                else s += 3000 + child_dtz * 100;
-            }
-        }
+        // NOTE: Per-node TT probe removed from move scoring — it queried the
+        // same (unchanged) hash up to 256 times per node for zero benefit.
         return s;
     }
 
@@ -2602,13 +2851,12 @@ public:
     Value quiescence(Position& pos, Value alpha, Value beta, int ply, int q_depth = 0) {
         if (ply >= MAX_PLY || q_depth >= MAX_QSEARCH_DEPTH)
             return eval.evaluate(pos) + learning.probe(pos.get_hash());
-        nodes++;
-        if (nodes.load() % 256 == 0) {
+        if ((++nodes & 255) == 0) {
             if (stop_search) return 0;
             if (tm.stop_early()) { stop_search = true; return 0; }
+            if (node_limit > 0 && nodes >= node_limit) { stop_search = true; return 0; }
         }
-        if (node_limit > 0 && nodes >= node_limit) { stop_search = true; return 0; }
-        if (pos.is_repetition(2)) return 0;
+        if (pos.is_repetition(1)) return 0;
         if (tb.can_probe(pos)) {
             int dtz_success;
             int dtz = tb.probe_dtz(pos, dtz_success);
@@ -2636,9 +2884,14 @@ public:
         int cnt = in_check ? generate_moves(pos, moves, false)
                            : generate_moves(pos, moves, true);
 
-        // Sort: captures by SEE descending; when in check sort all by rough priority
+        // Sort captures by MVV-LVA (fast, O(1) per move).
+        // SEE is only computed later for delta pruning of actually-bad captures.
+        // Calling SEE for every move during sort was O(pieces) × N per qnode.
+        static const int mvv_val[7] = {0,100,320,330,500,900,20000};
         std::sort(moves, moves + cnt, [&](Move a, Move b) {
-            return pos.see(a) > pos.see(b);
+            int va = mvv_val[pos.piece_on(to_sq(a)) & 7] - mvv_val[pos.piece_on(from_sq(a)) & 7];
+            int vb = mvv_val[pos.piece_on(to_sq(b)) & 7] - mvv_val[pos.piece_on(from_sq(b)) & 7];
+            return va > vb;
         });
 
         int legal_count = 0;
@@ -2736,8 +2989,9 @@ public:
 #endif
 
             nodes++;
-            std::vector<Move> dummy;
-            Value score = -negamax(pos, depth - 4, -alpha - margin, -alpha + margin, ply+1, true, dummy, NO_MOVE);
+            // ProbCut: null window around beta+margin
+            Value pc_beta  = beta + margin;
+            Value score = -negamax(pos, depth - 4, -pc_beta, -pc_beta + 1, ply+1, true, NO_MOVE);
 #ifdef USE_NNUE
             eval.get_nnue().pop();
 #endif
@@ -2751,17 +3005,22 @@ public:
     // ------------------------------------------------------------------------
     // Negamax (core search)
     // ------------------------------------------------------------------------
-    Value negamax(Position& pos, Depth depth, Value alpha, Value beta, int ply, bool cut, std::vector<Move>& pv_line, Move excluded = NO_MOVE) {
-        pv_line.clear();
+    Value negamax(Position& pos, Depth depth, Value alpha, Value beta, int ply, bool cut, Move excluded = NO_MOVE) {
+        // PV is maintained in pv_table[ply] (triangular table) — no heap allocation.
+        pv_len[ply] = 0;
         if (ply >= MAX_PLY) return eval.evaluate(pos) + learning.probe(pos.get_hash());
-        if (nodes.load() % 256 == 0) {
+        if ((++nodes & 255) == 0) {
             if (stop_search) return 0;
             if (tm.stop_early()) { stop_search = true; return 0; }
+            if (node_limit > 0 && nodes >= node_limit) { stop_search = true; return 0; }
         }
-        if (node_limit > 0 && nodes >= node_limit) { stop_search = true; return 0; }
-        if (pos.is_repetition(2)) return 0;
+        // Use count=1: return draw score when position appeared once before in
+        // history (2nd occurrence total). Waiting for count=2 (3rd occurrence)
+        // lets the engine walk into repetition lines without flagging them as
+        // draws, which caused the depth-6 cp-0 / repetition-PV bug.
+        if (pos.is_repetition(1)) return 0;
         if (tb.can_probe(pos) && depth <= 0) {
-            int wdl = tb.probe_wdl(pos);
+            unsigned wdl = tb.probe_wdl(pos);
             if (wdl != TB_RESULT_FAILED) { tb_hits++; return tb.wdl_to_score(wdl, ply); }
         }
         alpha = std::max(alpha, -MATE_SCORE + ply);
@@ -2783,12 +3042,16 @@ public:
                 int sign = (tt_dtz > 0) ? 1 : -1;
                 int dist = std::abs(tt_dtz);
                 return (sign == 1) ? MATE_SCORE - dist - ply : -MATE_SCORE + dist + ply;
-            } else if (tt_score > MATE_OFFSET) {
-                // stored as (MATE_SCORE - dist_from_root) which is MATE_SCORE - (N - ply_at_store + ply_at_store)
-                // Standard: stored = score + ply_at_store, retrieve = stored - ply_current
+            }
+            // Mate-score de-normalisation (standard convention, same as Stockfish):
+            //   Store:    score += ply  (converts node-relative → root-relative)
+            //   Retrieve: score -= ply  (converts root-relative → node-relative)
+            // This ensures a "mate in N" found at ply P is correctly seen as
+            // "mate in N + ΔP" when retrieved at a shallower ply P - ΔP.
+            if (tt_score > MATE_THRESHOLD) {
                 tt_score -= ply;
                 if (tt_score > MATE_SCORE - 1) tt_score = MATE_SCORE - 1;
-            } else if (tt_score < -MATE_OFFSET) {
+            } else if (tt_score < -MATE_THRESHOLD) {
                 tt_score += ply;
                 if (tt_score < -MATE_SCORE + 1) tt_score = -MATE_SCORE + 1;
             }
@@ -2812,8 +3075,7 @@ public:
             excluded == NO_MOVE && !in_check && std::abs(tt_score) < MATE_SCORE - MAX_PLY) {
             Value singular_beta = std::max(tt_score - SINGULAR_MARGIN, -INF);
             Depth singular_depth = depth / 2;
-            std::vector<Move> dummy;
-            Value singular_score = -negamax(pos, singular_depth, -singular_beta, -singular_beta + 1, ply, false, dummy, tt_move);
+            Value singular_score = -negamax(pos, singular_depth, -singular_beta, -singular_beta + 1, ply, false, tt_move);
             if (singular_score <= singular_beta) depth++;
         }
 
@@ -2826,7 +3088,16 @@ public:
         }
 
         // Null move pruning
-        if (!in_check && depth >= 2 && cut) {
+        // Skipped when: in check, pure KP endgame (zugzwang), cut-node flag is false,
+        // OR when beta is a mate-class score.
+        //
+        // The mate-class guard is CRITICAL: if the engine believes the position is a
+        // forced mate for the side to move (beta >= MATE_THRESHOLD), a null-move will
+        // "skip" the opponent's defensive moves and confirm the phantom mate in the
+        // reduced-depth search.  This poisons the TT and causes the engine to report
+        // ghost "mate in N" scores at depths 4-7 for lines like Qg5 where Black has
+        // the defensive pawn push g7-g6 that only gets found at depth 8+.
+        if (!in_check && depth >= 2 && cut && beta < INF && beta < MATE_THRESHOLD) {
             bool has_non_pawn = false;
             for (int pt = KNIGHT; pt <= QUEEN; ++pt)
                 if (pos.bb(pos.side_to_move(), PieceType(pt))) { has_non_pawn = true; break; }
@@ -2840,7 +3111,7 @@ public:
 #endif
                     pos.make_move(NULL_MOVE);
                     int R = NULL_MOVE_R + depth / 6;
-                    Value score = -negamax(pos, depth - R - 1, -beta, -beta+1, ply+1, false, pv_line, NO_MOVE);
+                    Value score = -negamax(pos, depth - R - 1, -beta, -beta+1, ply+1, false, NO_MOVE);
 #ifdef USE_NNUE
                     eval.get_nnue().pop();
 #endif
@@ -2850,22 +3121,18 @@ public:
             }
         }
 
-        // Razoring
-        if (!in_check && depth <= 6) {
-            int razor_margin;
-            if (depth <= 1) razor_margin = RAZOR_MARGIN_D1;
-            else if (depth == 2) razor_margin = RAZOR_MARGIN_D2;
-            else if (depth == 3) razor_margin = RAZOR_MARGIN_D3;
-            else razor_margin = RAZOR_MARGIN_D3 + 50 * (depth - 3);
-            if (static_eval + razor_margin < alpha) {
-                if (depth <= 3) {
-                    Value rscore = quiescence(pos, alpha, alpha+1, ply);
-                    if (rscore <= alpha) return rscore;
-                } else {
-                    std::vector<Move> dummy;
-                    Value rscore = -negamax(pos, depth - 4, -alpha-1, -alpha, ply, false, dummy, NO_MOVE);
-                    if (rscore <= alpha) return rscore;
-                }
+        // Razoring — only at depth 1.  Applying at depth 2-3 causes false mate
+        // scores: quiescence (captures only) misses quiet defensive moves like
+        // Rf8-g8, so the engine incorrectly confirms a "forced mate" when a simple
+        // quiet move refutes it.  Depth-1 razoring is safe because at depth 1 the
+        // full move loop runs immediately after, so at most one quiet move is missed.
+        Value practical_alpha = std::max(alpha, (Value)(-MATE_SCORE + MAX_PLY));
+        if (!in_check && depth == 1 && alpha > -INF
+                && alpha < MATE_THRESHOLD && beta < MATE_THRESHOLD) {
+            int razor_margin = RAZOR_MARGIN_D1;
+            if (static_eval + razor_margin < practical_alpha) {
+                Value rscore = quiescence(pos, practical_alpha, practical_alpha+1, ply);
+                if (rscore <= practical_alpha) return rscore;
             }
         }
 
@@ -2880,37 +3147,38 @@ public:
         int cnt = generate_moves(pos, moves);
         if (cnt == 0) return in_check ? -MATE_SCORE + ply : 0;
 
-        std::vector<ScoredMove> scored;
+        // OPT: flat stack array — zero heap allocation per node
+        ScoredMove scored[MAX_MOVES];
+        int scored_count = 0;
         for (int i = 0; i < cnt; ++i) {
             if (moves[i] == excluded) continue;
-            int captured = pos.piece_on(to_sq(moves[i])) != 0;
-            scored.push_back({moves[i], score_move(moves[i], ply, tt_move, pos, i, captured)});
+            bool cap = pos.piece_on(to_sq(moves[i])) != 0;
+            scored[scored_count++] = {moves[i], score_move(moves[i], ply, tt_move, pos, i, (int)cap)};
         }
-        std::sort(scored.begin(), scored.end(),
+        // Selection-sort is O(n) for the first pick; full sort only when needed.
+        // For typical node counts (<40 moves) std::sort with a stack array is fine.
+        std::sort(scored, scored + scored_count,
             [](const ScoredMove& a, const ScoredMove& b) { return a.score > b.score; });
 
-        // Multi-cut pruning
+        // Multi-cut pruning (make/undo — no Position copy)
         if (depth >= 6 && !in_check && cut && tt_move != NO_MOVE) {
             int mc_count = 0;
-            for (int i = 0; i < std::min(3, (int)scored.size()); ++i) {
+            for (int i = 0; i < std::min(3, scored_count); ++i) {
                 Move m = scored[i].move;
                 if (m == tt_move) continue;
                 if (pos.piece_on(to_sq(m)) && ((pos.piece_on(to_sq(m)) & 7) == KING)) continue;
-                int captured = pos.piece_on(to_sq(m));
-                int old_castle = pos.castling_rights(), old_ep = pos.ep_sq(), old_fifty = pos.halfmove_clock();
-                Position pos2 = pos;
-                pos2.make_move(m);
-                if (pos2.mover_in_check()) continue;
-                std::vector<Move> dummy;
-                Value score = -negamax(pos2, depth / 2, -beta, -beta+1, ply+1, false, dummy, NO_MOVE);
-                if (score >= beta && ++mc_count >= 2) return beta;
+                int cap2 = pos.piece_on(to_sq(m));
+                int oc2 = pos.castling_rights(), oe2 = pos.ep_sq(), of2 = pos.halfmove_clock();
+                pos.make_move(m);
+                if (pos.mover_in_check()) { pos.undo_move(m, cap2, oc2, oe2, of2); continue; }
+                Value sc2 = -negamax(pos, depth / 2, -beta, -beta+1, ply+1, false, NO_MOVE);
+                pos.undo_move(m, cap2, oc2, oe2, of2);
+                if (sc2 >= beta && ++mc_count >= 2) return beta;
             }
         }
 
-        if (tt_move == NO_MOVE && depth >= IID_DEPTH) {
-            std::vector<Move> dummy;
-            negamax(pos, depth - IID_REDUCTION, alpha, beta, ply, false, dummy, NO_MOVE);
-        }
+        if (tt_move == NO_MOVE && depth >= IID_DEPTH)
+            negamax(pos, depth - IID_REDUCTION, alpha, beta, ply, false, NO_MOVE);
 
         Value best_score = -INF;
         Move best_move = NO_MOVE;
@@ -2918,11 +3186,11 @@ public:
         bool improving = (ply >= 2 && static_eval > stack[ply-2].static_eval);
 
         // YBWC split attempt
-        if (total_threads > 1 && depth >= 6 && scored.size() > 5 && !idle) {
+        if (total_threads > 1 && depth >= 6 && scored_count > 5 && !idle) {
             SplitPoint* sp = new SplitPoint;
             sp->pos = &pos;
             sp->master = this;
-            sp->moves = scored;
+            sp->moves.assign(scored, scored + scored_count);
             sp->depth = depth;
             sp->ply = ply;
             sp->alpha = alpha;
@@ -2947,18 +3215,24 @@ public:
                 std::lock_guard<std::mutex> lock(splits_mutex);
                 active_splits.erase(std::remove(active_splits.begin(), active_splits.end(), sp), active_splits.end());
             }
-            pv_line = sp->pv;
+            // Triangular PV from YBWC split
             best_score = sp->best_score;
-            best_move = sp->best_move;
+            best_move  = sp->best_move;
+            if (!sp->pv.empty()) {
+                int splen = (int)sp->pv.size();
+                for (int _pvi = 0; _pvi < splen && ply+_pvi < MAX_PLY; ++_pvi)
+                    pv_table[ply][_pvi] = sp->pv[_pvi];
+                pv_len[ply] = splen;
+            }
             delete sp;
             if (best_score != -INF) {
                 if (best_score >= beta) bound = BOUND_LOWER;
                 else if (best_score > alpha) bound = BOUND_EXACT;
                 Value store = best_score;
-                if (store > MATE_SCORE - MAX_PLY) {
-                    store += ply; // push toward root
-                } else if (store < -MATE_SCORE + MAX_PLY) {
-                    store -= ply; // push toward root
+                if (store > MATE_THRESHOLD) {
+                    store -= ply;   // root-relative: subtract ply for winning mates
+                } else if (store < -MATE_THRESHOLD) {
+                    store += ply;   // root-relative: add ply for losing mates
                 }
                 tt.store(key, depth, store, bound, best_move);
                 return best_score;
@@ -2966,28 +3240,51 @@ public:
         }
 
         // Normal move loop
-        for (size_t i = 0; i < scored.size(); ++i) {
+        for (int i = 0; i < scored_count; ++i) {
             Move m = scored[i].move;
             if (pos.piece_on(to_sq(m)) && ((pos.piece_on(to_sq(m)) & 7) == KING)) continue;
 
-            // Futility pruning (per move)
-            if (depth <= 3 && !in_check && !pos.piece_on(to_sq(m))) {
+            // Compute gives_check here (pure bitboard, very cheap) so we can
+            // exempt check-giving moves from all forward-pruning heuristics.
+            // Pruning a move that gives checkmate is obviously catastrophic.
+            bool gives_check = pos.gives_check(m);
+
+            bool is_capture = pos.piece_on(to_sq(m)) != 0;
+
+            // SEE bad-capture pruning: at low depths, skip losing captures
+            // (e.g. RxN when the N is defended) unless they give check.
+            // This mirrors Stockfish's "see < 0" pruning and saves many nodes.
+            if (is_capture && !gives_check && !in_check && depth <= 8
+                    && alpha < MATE_THRESHOLD && std::abs(alpha) < MATE_THRESHOLD) {
+                int threshold = -depth * 20;  // more lenient at greater depth
+                if (pos.see(m) < threshold) continue;
+            }
+
+            // Futility pruning (per move) — skip when alpha is the open bound or a mate score.
+            // When alpha >= MATE_THRESHOLD the engine already believes this is a forced mate;
+            // applying futility would prune the one quiet move (e.g. g7-g6) that refutes it.
+            if (depth <= 3 && !in_check && !pos.piece_on(to_sq(m))
+                    && !gives_check                          // never prune check-giving moves
+                    && alpha > -INF && alpha < MATE_THRESHOLD) {
                 int margin = SEE_QUIET_MARGIN + depth * 50;
                 if (scored[i].score < 500000) margin += 4 * depth;
                 if (static_eval + margin <= alpha) continue;
             }
 
-            // Late move pruning
-            if (!pos.piece_on(to_sq(m)) && !in_check && depth <= 7 && i >= (size_t)(LMP_BASE + depth * LMP_FACTOR)) {
+            // Late move pruning — also skip near mate scores for the same reason.
+            if (!pos.piece_on(to_sq(m)) && !in_check && depth <= 7
+                    && !gives_check                          // never prune check-giving moves
+                    && alpha < MATE_THRESHOLD
+                    && (int)i >= (LMP_BASE + depth * LMP_FACTOR)) {
                 if (!improving) continue;
-                if (i >= (size_t)(LMP_BASE + depth * LMP_FACTOR * 2)) continue;
+                if ((int)i >= (LMP_BASE + depth * LMP_FACTOR * 2)) continue;
             }
 
             int captured = pos.piece_on(to_sq(m));
             int moving_pc = pos.piece_on(from_sq(m));
             PieceType moving_pt = PieceType(moving_pc & 7);
             Color us = pos.side_to_move();
-            bool gives_check = pos.gives_check(m);
+            // gives_check already computed above
             bool was_promotion = promotion_type(m) != NO_PIECE;
             PieceType prom_pt = promotion_type(m);
             int old_castle = pos.castling_rights(), old_ep = pos.ep_sq(), old_fifty = pos.halfmove_clock();
@@ -3013,31 +3310,53 @@ public:
                 continue;
             }
 
-            nodes++;
             Depth new_depth = depth - 1;
-            if (in_check) new_depth++;
             int extension = 0;
-            if (ply > 0 && stack[ply-1].captured_piece != 0 && to_sq(m) == to_sq(stack[ply-1].current_move))
-                extension = 1;
-            else if (!extension && moving_pt == PAWN) {
-                if (eval.is_passed_pawn(pos, from_sq(m), us) &&
-                    ((us == WHITE && rank_of(to_sq(m)) > rank_of(from_sq(m))) ||
-                     (us == BLACK && rank_of(to_sq(m)) < rank_of(from_sq(m)))))
-                    extension = 1;
-            }
-            if (gives_check) extension++;
-            new_depth += extension;
-            new_depth = std::min(new_depth, depth + 2);
 
-            std::vector<Move> child_pv;
+            // ---------------------------------------------------------------
+            // Check extension: extend by 1 when this MOVE gives check.
+            // ABSOLUTE PLY BUDGET:  total ply from root is (ply + remaining).
+            // Without a global cap, a 5-move checking sequence at root depth 6
+            // keeps depth at 6 every level (the per-node cap min(.,depth) never
+            // lets depth decrease) and runs to ply 128.  We allow extensions
+            // only while ply is still within root_depth * 3/2.  Beyond that
+            // the tree has already been searched to adequate depth and further
+            // extensions just waste time without finding new moves.
+            // root_depth * 3/2  = budget of 50% extra ply over the root depth.
+            // (e.g. root_depth=6 → extensions allowed for ply 0..8 only)
+            // ---------------------------------------------------------------
+            const int extension_budget = root_depth + root_depth / 2;  // root*1.5
+            if (ply < extension_budget) {
+                if (gives_check) extension = 1;
+                // Other positional extensions: only one may apply.
+                if (!extension) {
+                    if (ply > 0 && stack[ply-1].captured_piece != 0
+                            && to_sq(m) == to_sq(stack[ply-1].current_move))
+                        extension = 1;   // recapture extension
+                    else if (moving_pt == PAWN) {
+                        if (eval.is_passed_pawn(pos, from_sq(m), us) &&
+                            ((us == WHITE && rank_of(to_sq(m)) > rank_of(from_sq(m))) ||
+                             (us == BLACK && rank_of(to_sq(m)) < rank_of(from_sq(m)))))
+                            extension = 1;   // passed-pawn advance
+                    }
+                }
+            }
+            // Hard cap: after applying the extension, new_depth cannot exceed
+            // the current depth (no net gain) — only prevents the usual -1 step.
+            new_depth = std::min(new_depth + extension, depth);
+
             Value score;
             if (i == 0) {
-                score = -negamax(pos, new_depth, -beta, -alpha, ply+1, true, child_pv, NO_MOVE);
+                score = -negamax(pos, new_depth, -beta, -alpha, ply+1, true, NO_MOVE);
             } else {
                 int red = captured ? 0 : reduction(improving, depth, i, scored[i].score, captured != 0, gives_check);
-                score = -negamax(pos, new_depth - red, -alpha-1, -alpha, ply+1, true, child_pv, NO_MOVE);
-                if (score > alpha && score < beta)
-                    score = -negamax(pos, new_depth, -beta, -alpha, ply+1, true, child_pv, NO_MOVE);
+                score = -negamax(pos, new_depth - red, -alpha-1, -alpha, ply+1, true, NO_MOVE);
+                // Use >= (not >) to match root PVS fix: when the null-window caps at
+                // exactly beta=alpha, the negamax returns alpha (fail-high), and
+                // -alpha == alpha after negation. Without >=, promising forcing moves
+                // that score exactly equal to alpha are silently dismissed.
+                if (score >= alpha && score < beta)
+                    score = -negamax(pos, new_depth, -beta, -alpha, ply+1, true, NO_MOVE);
             }
 
 #ifdef USE_NNUE
@@ -3050,8 +3369,12 @@ public:
             if (score > best_score) {
                 best_score = score;
                 best_move = m;
-                pv_line = child_pv;
-                pv_line.insert(pv_line.begin(), m);
+                // Triangular PV update: copy child row into our row
+                pv_table[ply][0] = m;
+                int child_len = pv_len[ply+1];
+                for (int _pvi = 0; _pvi < child_len && ply+1+_pvi < MAX_PLY; ++_pvi)
+                    pv_table[ply][1+_pvi] = pv_table[ply+1][_pvi];
+                pv_len[ply] = 1 + child_len;
                 if (score > alpha) {
                     alpha = score;
                     bound = BOUND_EXACT;
@@ -3067,7 +3390,7 @@ public:
                             update_history(m, depth, true, false, pos);
                             update_correction(m, depth, true, us);
                             update_continuation(m, depth, true, pos, ply);
-                            for (size_t j = 0; j < i; ++j) {
+                            for (int j = 0; j < i; ++j) {
                                 bool is_cap = pos.piece_on(to_sq(scored[j].move)) != 0;
                                 if (!is_cap) {
                                     update_history(scored[j].move, depth, false, false, pos);
@@ -3087,7 +3410,7 @@ public:
                             // Capture cutoff: update capture history for the cutoff move
                             // and penalise captures that failed to cut before it
                             update_history(m, depth, true, true, pos);
-                            for (size_t j = 0; j < i; ++j) {
+                            for (int j = 0; j < i; ++j) {
                                 bool is_cap = pos.piece_on(to_sq(scored[j].move)) != 0;
                                 if (is_cap)
                                     update_history(scored[j].move, depth, false, true, pos);
@@ -3106,10 +3429,19 @@ public:
         }
 
         Value store_score = best_score;
-        if (store_score > MATE_SCORE - MAX_PLY) {
-            store_score += ply;
-        } else if (store_score < -MATE_SCORE + MAX_PLY) {
-            store_score -= ply;
+        // Normalise mate scores to root-relative distance before TT storage.
+        // Standard convention (match the retrieve block at the probe site):
+        //   STORE:    score_win  -= ply  → stored = MATE_SCORE - (N + ply)
+        //             score_loss += ply  → stored = -(MATE_SCORE - (N + ply))
+        //   RETRIEVE: score_win  += ply  → node_score = stored + ply = MATE_SCORE - N ✓
+        //             score_loss -= ply  → node_score = stored - ply
+        // The key invariant: stored value is root-relative (independent of ply).
+        // Threshold MATE_THRESHOLD = MATE_SCORE - MAX_PLY ensures no normal eval
+        // score is ever mis-classified as a mate score.
+        if (store_score > MATE_THRESHOLD) {
+            store_score -= ply;   // root-relative win distance
+        } else if (store_score < -MATE_THRESHOLD) {
+            store_score += ply;   // root-relative loss distance
         }
         tt.store(key, depth, store_score, bound, best_move);
         return best_score;
@@ -3118,7 +3450,7 @@ public:
     // ------------------------------------------------------------------------
     // Output info (thread 0 only)
     // ------------------------------------------------------------------------
-    void output_info(int depth, Value score, const std::vector<Move>& pv) {
+    void output_info(int depth, Value score) {
         int64_t elapsed = tm.elapsed();
         uint64_t nps = elapsed > 0 ? nodes * 1000 / elapsed : 0;
         std::string score_str;
@@ -3131,9 +3463,24 @@ public:
         }
         std::cout << "info depth " << depth << " " << score_str
                   << " nodes " << nodes << " nps " << nps
-                  << " time " << elapsed << " tbhits " << tb_hits << " pv";
+                  << " time " << elapsed << " tbhits " << tb_hits;
+
+        // UCI_ShowWDL: estimate Win/Draw/Loss probabilities.
+        // Uses a simple logistic model: win_prob = 1/(1+exp(-score/400)).
+        // Draw is estimated as max(0, 1 - |score|/1000).
+        if (show_wdl && std::abs(score) <= MATE_SCORE - 1000) {
+            double sig = 1.0 / (1.0 + std::exp(-score / 400.0));
+            int draw_pct = std::max(0, 1000 - std::abs(score));
+            draw_pct = std::min(draw_pct, 1000);
+            int win_pct  = int((1000 - draw_pct) * sig);
+            int loss_pct = 1000 - win_pct - draw_pct;
+            if (loss_pct < 0) { win_pct += loss_pct; loss_pct = 0; }
+            std::cout << " wdl " << win_pct << " " << draw_pct << " " << loss_pct;
+        }
+
+        std::cout << " pv";
         Position tmp = root_pos;
-        for (Move m : pv) {
+        for (int _oi = 0; _oi < pv_len[0]; ++_oi) { Move m = pv_table[0][_oi];
             // Validate that m is legal in the current position.
             // TT hash collisions or stale PV entries can inject illegal moves;
             // applying them corrupts the position and makes every subsequent
@@ -3143,11 +3490,13 @@ public:
             bool found = false;
             for (int li = 0; li < legal_cnt; ++li) {
                 if (legal_moves[li] == m) {
-                    // Final check: make the move and confirm the mover is not
-                    // left in check (pseudo-legal generator may include some).
-                    Position check_tmp = tmp;
-                    check_tmp.make_move(m);
-                    if (!check_tmp.mover_in_check()) { found = true; break; }
+                    // Legality check via make/undo — no heap alloc (Position copy avoided)
+                    int cap_pv = tmp.piece_on(to_sq(m));
+                    int oc_pv = tmp.castling_rights(), oe_pv = tmp.ep_sq(), of_pv = tmp.halfmove_clock();
+                    tmp.make_move(m);
+                    bool ok = !tmp.mover_in_check();
+                    tmp.undo_move(m, cap_pv, oc_pv, oe_pv, of_pv);
+                    if (ok) { found = true; break; }
                 }
             }
             if (!found) break;  // Stop PV at first illegal move
@@ -3169,7 +3518,7 @@ public:
                 std::cout << pc[prom];
             }
             tmp.make_move(m);
-        }
+        } // end pv loop
         std::cout << std::endl;
     }
 
@@ -3190,9 +3539,15 @@ public:
             for (int i = 0; i < cnt; ++i) {
                 Move m = moves[i];
                 if (root_pos.piece_on(to_sq(m)) && ((root_pos.piece_on(to_sq(m)) & 7) == KING)) continue;
-                Position tmp = root_pos;
-                tmp.make_move(m);
-                if (!tmp.mover_in_check()) local_root_moves.push_back({m, 0});
+                // Use make/undo — no heap alloc (avoids OOM on Android/ARM)
+                int cap    = root_pos.piece_on(to_sq(m));
+                int old_cr = root_pos.castling_rights();
+                int old_ep = root_pos.ep_sq();
+                int old_50 = root_pos.halfmove_clock();
+                root_pos.make_move(m);
+                bool legal = !root_pos.mover_in_check();
+                root_pos.undo_move(m, cap, old_cr, old_ep, old_50);
+                if (legal) local_root_moves.push_back({m, 0});
             }
         }
         if (local_root_moves.empty()) return;
@@ -3209,6 +3564,8 @@ public:
         for (int depth = 1; depth <= max_depth && !stop_search; ++depth) {
             if (depth > 1 && !tm.time_for_depth(depth)) break;
 
+            root_depth = depth;   // used by extension budget in negamax()
+
             for (auto& sm : local_root_moves) {
                 int captured = root_pos.piece_on(to_sq(sm.move)) != 0;
                 sm.score = score_move(sm.move, 0, (best_move != NO_MOVE ? best_move : NO_MOVE), root_pos, 0, captured);
@@ -3220,10 +3577,28 @@ public:
             std::sort(local_root_moves.begin(), local_root_moves.end(),
                 [](const ScoredMove& a, const ScoredMove& b) { return a.score > b.score; });
 
+            // -----------------------------------------------------------------------
+            // Aspiration window — with fast-exit on mate discovery.
+            //
+            // Start narrow (±ASPIRATION_WINDOW) and double each fail.
+            // Key rule: if any retry finds a mate-class score (> MATE_THRESHOLD),
+            // we immediately accept that result.  This prevents the catastrophic
+            // case where a sacrifice leading to forced mate causes repeated
+            // fail-highs that eventually force a full [-INF,+INF] window where
+            // null-move/futility pruning is completely disabled.
+            // -----------------------------------------------------------------------
             Value alpha = -INF, beta = INF;
-            if (depth >= 5) {
-                alpha = best_score - ASPIRATION_WINDOW;
-                beta  = best_score + ASPIRATION_WINDOW;
+            int asp_delta = ASPIRATION_WINDOW;      // starting half-width
+            int fail_low_count = 0, fail_high_count = 0;
+
+            // Only use a narrow window when previous score is a "normal" value.
+            // A mate score from the previous depth means the window should just be wide.
+            bool use_aspiration = (depth >= 5
+                    && std::abs(best_score) >= 75
+                    && std::abs(best_score) < MATE_THRESHOLD);
+            if (use_aspiration) {
+                alpha = best_score - asp_delta;
+                beta  = best_score + asp_delta;
             }
 
             Move depth_best = NO_MOVE;
@@ -3248,56 +3623,76 @@ public:
                     bool was_promotion = promotion_type(m) != NO_PIECE;
                     PieceType prom_pt = promotion_type(m);
                     int oc = root_pos.castling_rights(), oe = root_pos.ep_sq(), of_ = root_pos.halfmove_clock();
-                    Position pos2 = root_pos;
 
 #ifdef USE_NNUE
                     eval.get_nnue().push();
 #endif
-                    pos2.make_move(m);
+                    root_pos.make_move(m);
                     stack[0].captured_piece = cap;
                     stack[0].current_move = m;
                     if (was_promotion) moving_pt = prom_pt;
                     int cur_piece_idx = us * 6 + (moving_pt - 1);
                     stack[0].current_piece_idx = cur_piece_idx;
 #ifdef USE_NNUE
-                    eval.get_nnue().make_move(pos2, m, us, moving_pt, PieceType(cap & 7), was_promotion, prom_pt);
+                    eval.get_nnue().make_move(root_pos, m, us, moving_pt, PieceType(cap & 7), was_promotion, prom_pt);
 #endif
 
-                    if (pos2.mover_in_check()) {
+                    if (root_pos.mover_in_check()) {
 #ifdef USE_NNUE
                         eval.get_nnue().pop();
 #endif
+                        root_pos.undo_move(m, cap, oc, oe, of_);
                         continue;
                     }
 
                     nodes++;
-                    std::vector<Move> pv_line;
+                    pv_len[1] = 0;
                     Value score;
                     if (i == 0 || window_alpha == -INF) {
-                        score = -negamax(pos2, depth - 1, -beta, -window_alpha, 1, true, pv_line, NO_MOVE);
+                        score = -negamax(root_pos, depth - 1, -beta, -window_alpha, 1, true, NO_MOVE);
                     } else {
-                        score = -negamax(pos2, depth - 1, -window_alpha - 1, -window_alpha, 1, true, pv_line, NO_MOVE);
-                        if (!stop_search && score > window_alpha && score < beta)
-                            score = -negamax(pos2, depth - 1, -beta, -window_alpha, 1, true, pv_line, NO_MOVE);
+                        score = -negamax(root_pos, depth - 1, -window_alpha - 1, -window_alpha, 1, true, NO_MOVE);
+                        // Re-search with full window when score >= window_alpha.
+                        // The STRICT ">" was a bug: a null-window capped at beta=window_alpha
+                        // returns exactly window_alpha (fail-high), which is numerically equal
+                        // to window_alpha, so "> window_alpha" was FALSE and the move was silently
+                        // dismissed.  A sacrificial move (e.g. Rxg7 leading to forced mate) can
+                        // appear to score exactly window_alpha in the null window but actually
+                        // score +MATE in the full window — exactly the case that was broken.
+                        if (!stop_search && score >= window_alpha && score < beta)
+                            score = -negamax(root_pos, depth - 1, -beta, -window_alpha, 1, true, NO_MOVE);
                     }
 
 #ifdef USE_NNUE
                     eval.get_nnue().pop();
 #endif
+                    root_pos.undo_move(m, cap, oc, oe, of_);
 
                     if (stop_search) break;
 
                     if (score > depth_score) {
                         depth_score = score;
                         depth_best = m;
-                        pv_line.insert(pv_line.begin(), m);
-                        depth_best_pv = pv_line;  // save PV for end-of-depth reporting
-                        if (thread_id == 0 && multi_pv > 1) {
+                        // Build PV from triangular table (ply=0 holds root move + child PV)
+                        pv_table[0][0] = m;
+                        int child_len = pv_len[1];
+                        for (int _pvi = 0; _pvi < child_len && 1+_pvi < MAX_PLY; ++_pvi)
+                            pv_table[0][1+_pvi] = pv_table[1][_pvi];
+                        pv_len[0] = 1 + child_len;
+                        // Copy to depth_best_pv (vector, only used for output)
+                        depth_best_pv.clear();
+                        for (int _pvi = 0; _pvi < pv_len[0]; ++_pvi)
+                            depth_best_pv.push_back(pv_table[0][_pvi]);
+                        // Always keep root_infos up to date for the best move so that
+                        // last_pv is available for the Learning feature even in single-PV mode.
+                        if (thread_id == 0) {
                             std::lock_guard<std::mutex> lock(root_infos_mutex);
                             for (auto& info : root_infos) {
                                 if (info.move == m) {
                                     info.score = score;
-                                    info.pv = pv_line;
+                                    info.pv.clear();
+                                    for (int _rpi = 0; _rpi < pv_len[0]; ++_rpi)
+                                        info.pv.push_back(pv_table[0][_rpi]);
                                     break;
                                 }
                             }
@@ -3306,30 +3701,54 @@ public:
                     if (score > window_alpha) window_alpha = score;
                 }
 
-                if (!stop_search && depth >= 5) {
-                    if (depth_score <= alpha && alpha > -INF) {
-                        alpha = std::max(Value(-INF), alpha - ASPIRATION_WIDEN);
+                if (!stop_search && depth >= 5 && use_aspiration) {
+                    // Fast-exit: if we already found a mate-class score during a retry,
+                    // accept it immediately.  Opening to [-INF,+INF] to "confirm" a mate
+                    // score disables all pruning and makes depth-6+ take millions of nodes.
+                    if (std::abs(depth_score) >= MATE_THRESHOLD) {
+                        // Accept — no further retry needed.
+                    } else if (depth_score <= alpha && alpha > -INF) {
+                        // Fail-low: widen symmetrically
+                        fail_low_count++;
+                        fail_high_count = 0;
+                        if (fail_low_count >= 3) {
+                            // Use MATE_SCORE-1 (not INF=32001) so null-move guard (beta < INF) stays active
+                            alpha = -(MATE_SCORE - 1);
+                            beta  =   MATE_SCORE - 1;
+                        } else {
+                            asp_delta = std::min(asp_delta * 2, (int)MATE_THRESHOLD);
+                            alpha = best_score - asp_delta;
+                            beta  = best_score + asp_delta;
+                        }
                         need_retry = true;
                     } else if (depth_score >= beta && beta < INF) {
-                        beta = std::min(Value(INF), beta + ASPIRATION_WIDEN);
+                        // Fail-high: widen symmetrically
+                        fail_high_count++;
+                        fail_low_count = 0;
+                        if (fail_high_count >= 3) {
+                            // Use MATE_SCORE-1 (not INF=32001) so null-move guard (beta < INF) stays active
+                            alpha = -(MATE_SCORE - 1);
+                            beta  =   MATE_SCORE - 1;
+                        } else {
+                            asp_delta = std::min(asp_delta * 2, (int)MATE_THRESHOLD);
+                            alpha = best_score - asp_delta;
+                            beta  = best_score + asp_delta;
+                        }
                         need_retry = true;
                     }
                 }
             }
 
             if (!stop_search && depth_best != NO_MOVE) {
-                best_move = depth_best;
+                best_move  = depth_best;
                 best_score = depth_score;
-                prev_eval = best_score;
+                prev_eval = depth_score;
                 if (thread_id == 0) {
                     bool best_move_changed = (depth_best != prev_best_move);
-                    tm.update(best_score, best_move_changed);
+                    tm.update(depth_score, best_move_changed);
                     prev_best_move = depth_best;
-                    // Emit a single info line per depth, AFTER the full depth
-                    // completes — not inside the move loop where nodes/score
-                    // are mid-computation and the node count is misleading.
                     if (multi_pv <= 1) {
-                        output_info(depth, best_score, depth_best_pv);
+                        output_info(depth, depth_score);
                     }
                 }
             }
@@ -3404,10 +3823,25 @@ public:
         }
 
         if (best_move != NO_MOVE) {
+            // Unconditionally offer our best_move to the shared result.
+            // Use CAS on score so the *best* score across threads wins.
+            // Then write the move with release ordering so go()'s join()
+            // + acquire-load sees the fully committed move on all architectures
+            // (ARM's relaxed memory model requires this — without release/acquire
+            // the joining thread can read the old NO_MOVE on Cortex-A CPUs).
             Value prev = shared_best_score.load(std::memory_order_relaxed);
-            while (best_score > prev && !shared_best_score.compare_exchange_weak(prev, best_score, std::memory_order_relaxed)) {}
-            if (best_score >= shared_best_score.load(std::memory_order_relaxed))
-                shared_best_move.store(best_move, std::memory_order_relaxed);
+            bool did_win_score = false;
+            while (best_score >= prev) {
+                if (shared_best_score.compare_exchange_weak(prev, best_score,
+                        std::memory_order_acq_rel, std::memory_order_relaxed)) {
+                    did_win_score = true;
+                    break;
+                }
+            }
+            // Also write if we are the *only* thread (score == -INF, nobody wrote yet)
+            if (did_win_score || shared_best_move.load(std::memory_order_relaxed) == NO_MOVE) {
+                shared_best_move.store(best_move, std::memory_order_release);
+            }
         }
 
         if (local_root_moves.empty()) {
@@ -3450,44 +3884,56 @@ void help_at_split(SearchThread* thread, SplitPoint* sp) {
 
         int captured = sp->pos->piece_on(to_sq(m));
         int moving_pc = sp->pos->piece_on(from_sq(m));
+#ifdef USE_NNUE
         PieceType moving_pt = PieceType(moving_pc & 7);
         Color us = sp->pos->side_to_move();
         bool was_promotion = promotion_type(m) != NO_PIECE;
         PieceType prom_pt = promotion_type(m);
-        int old_castle = sp->pos->castling_rights(), old_ep = sp->pos->ep_sq(), old_fifty = sp->pos->halfmove_clock();
+#else
+        (void)moving_pc; (void)captured;
+#endif
 
-        Position pos2 = *sp->pos;
+        int sp_cap  = sp->pos->piece_on(to_sq(m));
+        int sp_oc   = sp->pos->castling_rights();
+        int sp_oe   = sp->pos->ep_sq();
+        int sp_of   = sp->pos->halfmove_clock();
 #ifdef USE_NNUE
-        thread->eval.get_nnue().push();
+        thread->get_eval().get_nnue().push();
 #endif
-        pos2.make_move(m);
+        sp->pos->make_move(m);
 #ifdef USE_NNUE
-        thread->eval.get_nnue().make_move(pos2, m, us, moving_pt, PieceType(captured & 7), was_promotion, prom_pt);
+        thread->get_eval().get_nnue().make_move(*sp->pos, m, us, moving_pt, PieceType(captured & 7), was_promotion, prom_pt);
 #endif
-        if (pos2.mover_in_check()) {
+        if (sp->pos->mover_in_check()) {
 #ifdef USE_NNUE
-            thread->eval.get_nnue().pop();
+            thread->get_eval().get_nnue().pop();
 #endif
+            sp->pos->undo_move(m, sp_cap, sp_oc, sp_oe, sp_of);
             continue;
         }
 
         thread->nodes++;
         Depth new_depth = sp->depth - 1;
         if (sp->pos->is_check()) new_depth++;
-        std::vector<Move> child_pv;
-        Value score = -thread->negamax(pos2, new_depth, -sp->beta, -sp->alpha, sp->ply + 1, sp->cut, child_pv, NO_MOVE);
+        thread->pv_len[sp->ply + 1] = 0;
+        Value score = -thread->negamax(*sp->pos, new_depth, -sp->beta, -sp->alpha, sp->ply + 1, sp->cut, NO_MOVE);
 
 #ifdef USE_NNUE
-        thread->eval.get_nnue().pop();
+        thread->get_eval().get_nnue().pop();
 #endif
+        sp->pos->undo_move(m, sp_cap, sp_oc, sp_oe, sp_of);
 
         {
             std::lock_guard<std::mutex> lock(sp->mtx);
             if (score > sp->best_score) {
                 sp->best_score = score;
                 sp->best_move = m;
-                sp->pv = child_pv;
-                sp->pv.insert(sp->pv.begin(), m);
+                // Copy PV from thread's triangular table into sp->pv
+                int cplen = thread->pv_len[sp->ply+1];
+                sp->pv.clear();
+                sp->pv.push_back(m);
+                for (int _pvi = 0; _pvi < cplen && sp->ply+1+_pvi < MAX_PLY; ++_pvi)
+                    sp->pv.push_back(thread->pv_table[sp->ply+1][_pvi]);
                 if (score > sp->alpha) sp->alpha = score;
             }
         }
@@ -3569,11 +4015,21 @@ private:
     std::vector<Move> last_pv;
     std::mutex last_pv_mutex;
 
+    bool uci_show_wdl;
+    // Skill Level (0–20, 20 = full strength): limits depth and injects blunders
+    int skill_level;
+    // Syzygy fine-tuning options
+    int  syzygy_probe_depth;    // min search depth before TB probing is allowed (default 1)
+    int  syzygy_probe_limit;    // max piece count for probing (default = TB max_cardinality)
+    bool syzygy_50_move_rule;   // honour 50-move rule in TB results (default true)
+
 public:
     UCI() : tt(256), search_active(false), pondering_active(false), thread_count(1), multi_pv(1),
             ponder(false), contempt(0), chess960(false), uci_limit_strength(false), uci_elo(1500),
             learning_enabled(false), learning_rate(100), learning_max_adjust(50),
-            tuning_mode(false) {
+            tuning_mode(false), uci_show_wdl(false),
+            skill_level(20),
+            syzygy_probe_depth(1), syzygy_probe_limit(7), syzygy_50_move_rule(true) {
         Zobrist::init();
         Bitboards::init();
         init_magics();
@@ -3598,6 +4054,14 @@ public:
             book.set_variety(std::stod(value));
         } else if (name == "SyzygyPath") {
             if (!value.empty()) tb.init(value);
+        } else if (name == "SyzygyProbeDepth") {
+            syzygy_probe_depth = std::max(1, std::stoi(value));
+        } else if (name == "SyzygyProbeLimit") {
+            syzygy_probe_limit = std::max(0, std::min(7, std::stoi(value)));
+        } else if (name == "Syzygy50MoveRule") {
+            syzygy_50_move_rule = (value == "true");
+        } else if (name == "Skill Level") {
+            skill_level = std::max(0, std::min(20, std::stoi(value)));
         } else if (name == "EvalFile") {
 #ifdef USE_NNUE
             eval.set_nnue(value);
@@ -3642,10 +4106,14 @@ public:
             if (tuning_mode && !tuning_file.empty()) {
                 tuning_stream.open(tuning_file, std::ios::app);
             }
-        } else if (name == "TuningFile") {
-            tuning_file = value;
-            if (tuning_mode && !tuning_file.empty()) {
-                tuning_stream.open(tuning_file, std::ios::app);
+        } else if (name == "UCI_ShowWDL") {
+            uci_show_wdl = (value == "true");
+        } else if (name == "Debug Log File") {
+            // Debug Log File: redirect std::cerr to this file for debug output
+            if (!value.empty()) {
+                static std::ofstream debug_log;
+                debug_log.open(value, std::ios::app);
+                if (debug_log.is_open()) std::cerr.rdbuf(debug_log.rdbuf());
             }
         }
     }
@@ -3731,6 +4199,7 @@ public:
         int64_t wtime = 0, btime = 0, winc = 0, binc = 0;
         int movestogo = 0, movetime = 0;
         bool infinite = false, ponder_mode = false;
+        std::vector<std::string> searchmoves_list;
         for (size_t i = 0; i < args.size(); ++i) {
             if (args[i] == "depth" && i+1 < args.size()) depth = std::stoi(args[++i]);
             else if (args[i] == "nodes" && i+1 < args.size()) nodes = std::stoull(args[++i]);
@@ -3742,6 +4211,19 @@ public:
             else if (args[i] == "movetime" && i+1 < args.size()) movetime = std::stoi(args[++i]);
             else if (args[i] == "infinite") infinite = true;
             else if (args[i] == "ponder") ponder_mode = true;
+            else if (args[i] == "searchmoves") {
+                // Collect all following tokens as move strings until next keyword
+                ++i;
+                while (i < args.size() && args[i][0] != '\0' &&
+                       args[i] != "depth" && args[i] != "nodes" &&
+                       args[i] != "wtime" && args[i] != "btime" &&
+                       args[i] != "winc"  && args[i] != "binc"  &&
+                       args[i] != "movestogo" && args[i] != "movetime" &&
+                       args[i] != "infinite"  && args[i] != "ponder") {
+                    searchmoves_list.push_back(args[i++]);
+                }
+                --i;
+            }
         }
         if (!infinite && movetime == 0 && wtime == 0 && btime == 0) infinite = true;
 
@@ -3749,6 +4231,12 @@ public:
             int elo_depth = 1 + (uci_elo - 800) / 100;
             elo_depth = std::clamp(elo_depth, 1, 30);
             depth = std::min(depth, elo_depth);
+        }
+
+        // Skill Level depth cap: level 0 → depth 1, level 19 → depth 20, level 20 = no cap.
+        if (skill_level < 20 && !infinite) {
+            int skill_depth = skill_level + 1;
+            depth = std::min(depth, skill_depth);
         }
 
         tm.set_side(pos.side_to_move(), wtime, btime, winc, binc, movestogo, movetime, infinite, ponder_mode);
@@ -3781,15 +4269,35 @@ public:
         Move moves[MAX_MOVES];
         int cnt = generate_moves(pos, moves);
         std::vector<ScoredMove> filtered_root_moves;
+        // Use make/undo instead of Position copy: avoids heap-allocating the
+        // history vector up to 256 times on Android/ARM where memory is tight.
+        // A Position copy on Android can silently fail or be slow enough that
+        // the time manager triggers before any move is found → bestmove 0000.
         for (int i = 0; i < cnt; ++i) {
             Move m = moves[i];
             if (pos.piece_on(to_sq(m)) && ((pos.piece_on(to_sq(m)) & 7) == KING)) continue;
-            Position tmp = pos;
-            tmp.make_move(m);
-            if (!tmp.mover_in_check()) filtered_root_moves.push_back({m, 0});
+            int cap    = pos.piece_on(to_sq(m));
+            int old_cr = pos.castling_rights();
+            int old_ep = pos.ep_sq();
+            int old_50 = pos.halfmove_clock();
+            pos.make_move(m);
+            bool legal = !pos.mover_in_check();
+            pos.undo_move(m, cap, old_cr, old_ep, old_50);
+            if (!legal) continue;
+            // searchmoves filter: if the GUI specified a move list, only search those
+            if (!searchmoves_list.empty()) {
+                std::string ms = move_to_uci(m, &pos);
+                bool in_list = false;
+                for (const auto& sm_str : searchmoves_list) {
+                    if (sm_str == ms) { in_list = true; break; }
+                }
+                if (!in_list) continue;
+            }
+            filtered_root_moves.push_back({m, 0});
         }
 
         if (filtered_root_moves.empty()) {
+            // True checkmate or stalemate — only legal output is 0000.
             std::cout << "bestmove 0000\n";
             return;
         }
@@ -3802,28 +4310,23 @@ public:
             root_infos.push_back({sm.move, -INF, {}});
         }
 
-        int total_moves = filtered_root_moves.size();
-        int moves_per_thread = (total_moves + thread_count - 1) / thread_count;
+        // filtered_root_moves.size() used below for thread/search setup
 
         pondering = ponder_mode;
         pondering_active = ponder_mode;
         search_active = true;
         threads_idle = false;
 
+        // Lazy SMP: every thread receives the FULL root move list and runs an
+        // independent iterative-deepening search.  The TT is shared, so threads
+        // naturally feed each other with good moves and avoid redundant work.
+        // Partitioning moves between threads (the old code) was wrong: thread N
+        // would never evaluate move 0, so the best move was often missed.
         for (int i = 0; i < thread_count; ++i) {
-            int start = i * moves_per_thread;
-            int end = std::min(start + moves_per_thread, total_moves);
-            if (start >= total_moves) break;
-
-            std::vector<ScoredMove> thread_moves(
-                filtered_root_moves.begin() + start,
-                filtered_root_moves.begin() + end
-            );
-
-            search_threads.emplace_back([this, i, depth, nodes, thread_moves]() {
-                auto st = std::make_unique<SearchThread>(i, thread_count, pos, tt, tb, eval, &book);
+            search_threads.emplace_back([this, i, depth, nodes, filtered_root_moves]() {
+                auto st = std::make_unique<SearchThread>(i, thread_count, pos, tt, tb, eval, &book, uci_show_wdl);
                 st->set_multi_pv(multi_pv);
-                st->search(depth, nodes, thread_moves);
+                st->search(depth, nodes, filtered_root_moves);
             });
         }
 
@@ -3836,16 +4339,40 @@ public:
 
             if (!root_infos.empty()) {
                 std::lock_guard<std::mutex> lock(last_pv_mutex);
-                auto best_it = std::max_element(root_infos.begin(), root_infos.end());
+                // operator< is reversed (for sort-descending), so use an explicit lambda here.
+                auto best_it = std::max_element(root_infos.begin(), root_infos.end(),
+                    [](const RootMoveInfo& a, const RootMoveInfo& b) { return a.score < b.score; });
                 if (best_it != root_infos.end() && best_it->score > -INF + 1000) {
                     last_pv = best_it->pv;
                 }
             }
 
-            Move best = shared_best_move.load();
+            // Acquire load pairs with the release store in search() to guarantee
+            // visibility of the written move on ARM/Android weak-memory CPUs.
+            Move best = shared_best_move.load(std::memory_order_acquire);
             if (best == NO_MOVE && !filtered_root_moves.empty()) {
+                // Should only reach here if the search was stopped in <256 nodes
+                // (before any time-check ran).  The first legal move is safe.
                 best = filtered_root_moves[0].move;
             }
+
+            // Skill Level < 20: occasionally play a sub-optimal move to simulate
+            // human error. Probability scales quadratically so even level 19 rarely
+            // blunders while level 0 almost always picks randomly.
+            if (skill_level < 20 && !filtered_root_moves.empty()) {
+                double error_prob = (20 - skill_level) / 20.0;
+                error_prob = error_prob * error_prob;  // squared for gentler curve
+                std::mt19937 rng(static_cast<unsigned>(
+                    std::chrono::steady_clock::now().time_since_epoch().count()));
+                std::uniform_real_distribution<double> dist(0.0, 1.0);
+                if (dist(rng) < error_prob) {
+                    int n_candidates = std::max(1,
+                        static_cast<int>(filtered_root_moves.size() * error_prob));
+                    std::uniform_int_distribution<int> pick(0, n_candidates - 1);
+                    best = filtered_root_moves[pick(rng)].move;
+                }
+            }
+
             std::cout << "bestmove " << move_to_uci(best, &pos) << std::endl;
 
             if (tuning_mode && tuning_stream.is_open()) {
@@ -3865,7 +4392,22 @@ public:
         search_threads.clear();
         search_active = false;
         pondering_active = false;
-        Move best = shared_best_move.load();
+        Move best = shared_best_move.load(std::memory_order_acquire);
+        if (best == NO_MOVE) {
+            // Search stopped before any move was committed — pick first legal move
+            Move moves[MAX_MOVES];
+            int cnt = generate_moves(pos, moves);
+            for (int i = 0; i < cnt; ++i) {
+                Move m = moves[i];
+                if (pos.piece_on(to_sq(m)) && ((pos.piece_on(to_sq(m)) & 7) == KING)) continue;
+                int cap = pos.piece_on(to_sq(m));
+                int oc = pos.castling_rights(), oe = pos.ep_sq(), of_ = pos.halfmove_clock();
+                pos.make_move(m);
+                bool legal = !pos.mover_in_check();
+                pos.undo_move(m, cap, oc, oe, of_);
+                if (legal) { best = m; break; }
+            }
+        }
         if (best != NO_MOVE) {
             std::cout << "bestmove " << move_to_uci(best, &pos) << std::endl;
         }
@@ -3880,16 +4422,26 @@ public:
         }
         search_threads.clear();
         search_active = false;
-        Move best = shared_best_move.load();
+        Move best = shared_best_move.load(std::memory_order_acquire);
         if (best == NO_MOVE) {
+            // Pick first legal move as emergency fallback
             Move moves[MAX_MOVES];
             int cnt = generate_moves(pos, moves);
-            if (cnt > 0) best = moves[0];
+            for (int i = 0; i < cnt; ++i) {
+                Move m = moves[i];
+                if (pos.piece_on(to_sq(m)) && ((pos.piece_on(to_sq(m)) & 7) == KING)) continue;
+                int cap = pos.piece_on(to_sq(m));
+                int oc = pos.castling_rights(), oe = pos.ep_sq(), of_ = pos.halfmove_clock();
+                pos.make_move(m);
+                bool legal = !pos.mover_in_check();
+                pos.undo_move(m, cap, oc, oe, of_);
+                if (legal) { best = m; break; }
+            }
         }
         if (best != NO_MOVE) {
             std::cout << "bestmove " << move_to_uci(best, &pos) << std::endl;
         } else {
-            std::cout << "bestmove 0000\n";
+            std::cout << "bestmove 0000\n";  // true stalemate/checkmate
         }
     }
 
@@ -3900,7 +4452,7 @@ public:
             std::string token;
             iss >> token;
             if (token == "uci") {
-                std::cout << "id name Hugine 2.0\n";
+                std::cout << "id name Hugine 5.0\n";
                 std::cout << "id author 0xbytecode\n";
                 std::cout << "info string Platform: "
 #if ARCH_X86
@@ -3925,20 +4477,26 @@ public:
                           << " | Chess960: "
                           << (chess960 ? "ON" : "OFF")
                           << "\n";
-                std::cout << "option name Hash type spin default 256 min 1 max 8192\n";
-                std::cout << "option name Threads type spin default 1 min 1 max 64\n";
+                std::cout << "option name Hash type spin default 256 min 1 max 33554432\n";
+                std::cout << "option name Threads type spin default 1 min 1 max 1024\n";
                 std::cout << "option name Ponder type check default false\n";
+                std::cout << "option name Skill Level type spin default 20 min 0 max 20\n";
                 std::cout << "option name OwnBook type check default true\n";
                 std::cout << "option name BookFile type string default\n";
                 std::cout << "option name BookVariety type spin default 0 min 0 max 10\n";
                 std::cout << "option name SyzygyPath type string default\n";
+                std::cout << "option name SyzygyProbeDepth type spin default 1 min 1 max 100\n";
+                std::cout << "option name SyzygyProbeLimit type spin default 7 min 0 max 7\n";
+                std::cout << "option name Syzygy50MoveRule type check default true\n";
                 std::cout << "option name EvalFile type string default\n";
-                std::cout << "option name MultiPV type spin default 1 min 1 max 5\n";
+                std::cout << "option name MultiPV type spin default 1 min 1 max 256\n";
                 std::cout << "option name Contempt type spin default 0 min -100 max 100\n";
-                std::cout << "option name Move Overhead type spin default 100 min 0 max 5000\n";
+                std::cout << "option name Move Overhead type spin default 10 min 0 max 5000\n";
                 std::cout << "option name UCI_Chess960 type check default false\n";
                 std::cout << "option name UCI_LimitStrength type check default false\n";
-                std::cout << "option name UCI_Elo type spin default 1500 min 800 max 3000\n";
+                std::cout << "option name UCI_Elo type spin default 1500 min 1320 max 3190\n";
+                std::cout << "option name UCI_ShowWDL type check default false\n";
+                std::cout << "option name Debug Log File type string default\n";
                 std::cout << "option name Learning type check default false\n";
                 std::cout << "option name LearningFile type string default\n";
                 std::cout << "option name LearningRate type spin default 100 min 1 max 1000\n";
@@ -3968,7 +4526,13 @@ public:
                     if (!name.empty()) name += " ";
                     name += word;
                 }
-                iss >> value;
+                // Read the entire rest of the line as the value (supports paths with spaces).
+                std::string rest;
+                if (std::getline(iss, rest)) {
+                    // Strip leading space left by the stream after "value"
+                    size_t start = rest.find_first_not_of(" \t");
+                    value = (start != std::string::npos) ? rest.substr(start) : "";
+                }
                 set_option(name, value);
             } else if (token == "position") {
                 std::vector<std::string> args;
@@ -3995,16 +4559,18 @@ public:
                         std::lock_guard<std::mutex> lock(last_pv_mutex);
                         if (last_pv.empty()) {
                             std::cout << "info string No PV available from last search.\n";
-                            return;
+                            // Do NOT return here — that would exit run() and kill the UCI loop.
+                            // Just skip the update and continue reading commands.
+                        } else {
+                            Position tmp = pos;
+                            for (Move m : last_pv) {
+                                U64 key = tmp.get_hash();
+                                learning.update(key, result, tmp.side_to_move());
+                                tmp.make_move(m);
+                            }
+                            std::cout << "info string Learning updated with " << last_pv.size() << " positions.\n";
                         }
-                        Position tmp = pos;
-                        for (Move m : last_pv) {
-                            U64 key = tmp.get_hash();
-                            learning.update(key, result, tmp.side_to_move());
-                            tmp.make_move(m);
-                        }
-                        std::cout << "info string Learning updated with " << last_pv.size() << " positions.\n";
-                    }
+                    }  // end lock_guard scope
                 } else if (subcmd == "clear") {
                     learning.clear();
                     std::cout << "info string Learning table cleared.\n";

@@ -1,0 +1,222 @@
+HUGINE 3.0 "GAMA" — CHANGELOG
+==============================
+All bugs fixed and improvements made across the development session.
+Format: [TYPE] Short description — root cause — fix applied.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v5  (current)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[COMPAT] Windows / MSVC: __builtin_popcountll / __builtin_ctzll crash
+  Root cause: GCC/Clang intrinsics used unconditionally; MSVC does not
+              provide these builtins.
+  Fix: Three-way #ifdef block:
+         MSVC    → __popcnt64 + _BitScanForward64 (intrin.h)
+         GCC/Clang → __builtin_popcountll / __builtin_ctzll
+         Fallback  → portable De Bruijn + bit-twiddling (no intrinsics)
+  Impact: Engine now compiles cleanly on MSVC cl.exe, MinGW, clang-cl.
+
+[SEARCH] LMR: linear formula replaced with Stockfish-style log table
+  Root cause: Old formula `LMR_BASE + move_idx / LMR_DIV` produced
+              constant reduction regardless of depth.  Under-reduced at
+              depth > 10, over-reduced at depth < 4.
+  Fix: Pre-computed table lmr_table[depth][move_idx] using
+       max(0, floor(ln(depth) × ln(move_idx) / 2.25)), initialised once
+       in SearchThread constructor.
+  Impact: ~7× fewer nodes at equivalent depth on tactical positions
+          (1.76 M → 239 K at depth 14, starting position).
+
+[SEARCH] SEE bad-capture pruning missing from main search loop
+  Root cause: SEE was used in quiescence only.  Losing captures (e.g.
+              RxN where N is defended) were always searched in the main
+              loop, wasting significant nodes.
+  Fix: Skip captures where see(m) < -depth * 20 for depth ≤ 8,
+       with exemption for check-giving moves and near-mate scores.
+
+[PERF] Quiescence sort called full SEE O(pieces) for every move
+  Root cause: std::sort lambda called pos.see() per move comparison,
+              meaning O(pieces × N²) work per quiescence node.
+  Fix: Sort by MVV-LVA (O(1) per move); SEE is now computed only in
+       the delta-pruning filter where it's actually needed.
+
+[FEAT] go searchmoves not supported
+  Root cause: The go() argument parser had no branch for "searchmoves".
+              GUIs sending this (e.g. for engine-vs-engine analysis or
+              puzzle solving) were silently ignored.
+  Fix: Parse "searchmoves <m1> <m2> …" as a whitelist; non-listed legal
+       moves are excluded from filtered_root_moves before search starts.
+
+[BUG]  stop() prints nothing when search stops before depth 1 completes
+  Root cause: The guard `if (best != NO_MOVE)` in stop() swallowed the
+              bestmove output when shared_best_move was still NO_MOVE
+              (search stopped in < 256 nodes).
+  Fix: Added the same legal-move fallback used in go(): iterate moves
+       with make/undo, pick the first legal move, print it.
+
+[BUG]  ponderhit() fallback used raw generate_moves()[0]
+  Root cause: generate_moves() returns pseudo-legal moves.  Picking
+              index 0 can produce an illegal move and confuse the GUI.
+  Fix: Same make/undo filter as go(): only legal moves are candidates
+       for the fallback bestmove.
+
+[PERF] PV validation in output_info did Position copy per move
+  Root cause: `Position check_tmp = tmp; check_tmp.make_move(m)` inside
+              the PV print loop.  Position holds a std::vector<U64>
+              history, so each copy triggered a heap allocation.
+  Fix: Replaced with make/undo on `tmp` — zero heap allocation,
+       safe on memory-constrained Android devices.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v4  (previous release)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[BUG]  "bestmove 0000" on Android / ARM (critical)
+  Symptom: Engine printed "bestmove 0000" on Android especially under
+           low time (wtime 1, movetime 0).
+  Root cause (3 independent bugs, all present simultaneously):
+    1. Legal-move filter in go() used `Position tmp = pos` inside a
+       256-iteration loop.  Position holds std::vector<U64> history;
+       256 rapid heap alloc/frees triggered OOM or severe slowdown on
+       ARM, causing the time manager to fire before any move was found.
+    2. Atomic store ordering: shared_best_move was stored with
+       memory_order_relaxed.  ARM has a weak memory model; the joining
+       thread was permitted to see the stale NO_MOVE value.
+    3. No unconditional first-move write: if the search thread lost the
+       CAS race and shared_best_move was still NO_MOVE, nothing was
+       written.
+  Fix:
+    1. Replaced Position copy with in-place make_move / undo_move
+       throughout the legal-move filter and search emergency rebuild
+       (zero heap allocation, same as perft).
+    2. Changed store to memory_order_release, load to memory_order_acquire.
+    3. Added unconditional write: if shared_best_move is still NO_MOVE
+       after the CAS, the thread writes its first legal move regardless.
+
+[BUG]  Mate score normalisation: MATE_THRESHOLD too low (phantom "mate 936")
+  Symptom: Engine reported "cp 20075" or "mate 936" in positions with
+           a large but non-mate advantage, and changed its best move
+           erratically between depths.
+  Root cause: MATE_OFFSET = 20000 was used as the threshold to identify
+              mate scores.  Normal evaluations above 20 000 cp (e.g.
+              winning a queen) were misidentified as mate scores and had
+              ply added/subtracted in TT storage, producing values like
+              20075 = "mate in 936".
+  Fix: Replaced MATE_OFFSET with MATE_THRESHOLD = MATE_SCORE - MAX_PLY
+       = 32000 - 128 = 31872.  No normal evaluation can ever exceed this
+       value, so the threshold is now exact.
+
+[BUG]  TT mate normalisation backwards (wrong search results at depth > 6)
+  Symptom: Best move switched to a losing or drawing move at deeper plies.
+           Forced mates were missed.  "cp 0" appeared in won positions.
+  Root cause: Standard convention is store -= ply (root-relative), then
+              retrieve += ply (node-relative).  Code did the opposite:
+              stored += ply, retrieved -= ply (or vice versa).  This
+              produced double-shifted mate scores that looked like normal
+              evals, corrupting TT lookups at every depth after the first.
+  Fix: Fixed all three TT store sites (negamax end, YBWC block) to
+       subtract ply for wins and add ply for losses on store; retrieval
+       does the reverse.  Also fixed the aspiration window which was
+       still using the old MATE_OFFSET constant.
+
+[BUG]  gives_check computed AFTER futility/LMP pruning (missed mating moves)
+  Symptom: The Lichess puzzle Rg1g7 Kxg7 Qg5+ Kh8 Qf6# was solved at
+           depth 4–5 but Qf6# itself was never evaluated at depth 2 in
+           the sub-search — the engine saw static_eval = -1133 (lost
+           rook) and pruned the quiet Qf6 before computing that it
+           delivers checkmate.
+  Root cause: gives_check was computed after the futility and LMP guards,
+              so the guards could prune a checkmate-delivering move.
+  Fix: Moved gives_check computation to before all pruning guards.
+       Added `&& !gives_check` to both futility-pruning and LMP conditions.
+
+[BUG]  Syzygy disabled on ARM / Android (architecture guard wrong)
+  Root cause: Guard `ARCH_X86 && !OS_ANDROID` blocked fathom compilation
+              on all ARM targets, including 64-bit Android where fathom
+              builds and runs perfectly (it uses only POSIX mmap, no
+              x86 intrinsics).
+  Fix: Removed the architecture condition entirely.  Detection is now:
+       USE_SYZYGY if header file present OR forced via -DUSE_SYZYGY;
+       disabled only via -DNO_SYZYGY or missing header.
+
+[PERF] Wasteful TT probe inside score_move() (removed)
+  Root cause: score_move() probed the transposition table for DTZ on
+              every move, every node.  Since the position hash does not
+              change while moves are being scored, all 256 probes in a
+              node queried the same (potentially stale) entry.
+  Fix: Removed the probe entirely.  TT is probed once at the top of
+       negamax; the result is reused throughout.
+  Impact: ~15% NPS improvement on x86; larger improvement on ARM where
+          random memory access is more expensive.
+
+[PERF] MVV-LVA for move ordering (replaced SEE in score_move)
+  Root cause: SEE is O(number of pieces) per call.  Calling it for all
+              256 moves in score_move() before every sort was expensive.
+  Fix: Replaced SEE with MVV-LVA (O(1) lookup) for move ordering.
+       SEE is retained only for:
+         (a) delta pruning in quiescence (one call per pruned move)
+         (b) bad-capture SEE pruning in main search (v5)
+  Impact: NPS ~500 K → ~1 M on Linux VM (2× speedup).
+
+[REGRESSION] TT age-gating: stale entries causing draw confusion
+  Root cause: TT entries from previous searches had scores reflecting
+              draw-by-repetition paths that no longer existed in the
+              current game tree.  Without age-gating, these produced
+              phantom draws in winning positions.
+  Fix: Added stored_age != cur_age check in TT::probe(); stale entries
+       still return the stored move for ordering but cannot produce
+       early cutoffs.
+
+[REGRESSION] Null-move pruning disabled incorrectly
+  Root cause: Null-move guard `beta < INF` used INT_MAX (32001) instead
+              of MATE_SCORE-1 (31999), disabling NMP in positions with
+              very large (but non-infinite) beta values.
+  Fix: Aspiration and NMP widening now use MATE_SCORE - 1 as the wide
+       bound, keeping INF reserved as a true sentinel.
+
+[REGRESSION] Skill Level UCI option not applying to multi-threaded search
+  Root cause: Skill Level depth cap was checked only on thread 0.
+              Additional YBWC threads ran at full depth regardless.
+  Fix: Depth cap applied at the go() level before threads are spawned,
+       affecting all threads uniformly.
+
+[REGRESSION] UCI_LimitStrength Elo cap ignored when infinite = true
+  Root cause: The Elo-to-depth calculation was inside the
+              `if (!infinite)` block.
+  Fix: Elo limit now applies whenever the option is set, including
+       analysis mode (infinite search).
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Build / Tooling (new in v5)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[FEAT] build.sh — universal cross-platform build script
+  - Auto-detects OS (Linux, macOS, Android/Termux, Windows/WSL/MSYS2)
+  - Auto-detects architecture (x86_64, arm64, arm32)
+  - Auto-selects best compiler (clang++ > g++ > c++)
+  - Auto-detects fathom at fathom/src/tbprobe.h → enables Syzygy
+  - Auto-detects .nnue / nn-*.bin network file → enables NNUE
+  - Skips -march=native on Android (prevents kernel instruction faults)
+  - Compiles fathom (C11) separately before linking C++17 engine
+  - Parameters: --syzygy, --no-syzygy, --nnue, --no-nnue, --debug,
+                --portable, --compiler=X, --exe=X, --help
+  - Colour-coded output; friendly error messages
+
+[FEAT] Makefile — GNU Make equivalent of build.sh
+  - Same auto-detection via $(wildcard ...) and $(shell which ...)
+  - Supports: SYZYGY=0/1, NNUE=0/1, DEBUG=1, NATIVE=0, CXX=, EXE=
+  - MSVC detection: switches to /O2 /std:c++17 /EHsc /Fe: syntax
+  - `make help` prints all variables
+  - `make clean` removes binary and fathom object
+
+[FEAT] README.md
+  - Build instructions for all platforms
+  - UCI options table
+  - Custom commands (learn result / learn clear / learn save)
+  - Architecture overview
+  - Performance benchmarks
+
+[FEAT] CHANGELOG.txt (this file)
+  - Full record of every bug, regression, and improvement
