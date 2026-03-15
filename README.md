@@ -1,7 +1,7 @@
 <div align="center">
 
 # ♟ Hugine
-
+note : this readme not latest version updated bu the code is ; ill manage later update this readme carefully. -the basic setup instructions still same , only features add -
 ### A high-performance UCI chess engine written in C++17
 
 [![Version](https://img.shields.io/badge/version-5.0_Iota-blue?style=flat-square)](https://github.com/ABDO10DZ/hugine/releases)
