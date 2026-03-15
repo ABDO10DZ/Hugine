@@ -1,308 +1,168 @@
+cmake_minimum_required(VERSION 3.14)
+project(Hugine VERSION 5.1.0 LANGUAGES CXX)
+
 # =============================================================================
-# Hugine 5.0 "Iota" — CMakeLists.txt
+# Hugine 5.1.0 "Iota" — CMake Build
 # =============================================================================
-# Mirrors builder.sh / Makefile auto-detection logic exactly.
+# Options (pass with -D<OPTION>=ON|OFF):
+#
+#   NNUE         ON   Compile NNUE evaluator (default: auto)
+#                     Supports Hugine-native .nnue + any Stockfish .nnue natively
+#   NNUE_LARGE   OFF  512-node Hugine-native architecture
+#   NNUE_XL      OFF  1024-node Hugine-native architecture (implies NNUE_LARGE)
+#   SYZYGY       OFF  Syzygy endgame tablebase support (requires Fathom)
+#   PEXT         OFF  BMI2 PEXT bitboards (x86_64 only)
+#   NATIVE       ON   -march=native (disable for portable builds)
+#   AVX2         OFF  Force AVX2 SIMD
+#   SSE4         OFF  Force SSE4.1 SIMD
+#   SANITIZE     OFF  ASAN + UBSAN (debug)
 #
 # Quick start:
-#   mkdir build && cd build
-#   cmake ..                        # auto-detect everything
-#   cmake --build .
+#   cmake -B build -DNNUE=ON
+#   cmake --build build --config Release
 #
-# Override options:
-#   cmake .. -DSYZYGY=ON            # force Syzygy on  (Fathom must exist)
-#   cmake .. -DSYZYGY=OFF           # force Syzygy off
-#   cmake .. -DNNUE=ON              # force NNUE on    (.nnue file must exist)
-#   cmake .. -DNNUE=OFF             # force NNUE off
-#   cmake .. -DNATIVE=OFF           # no -march=native (portable / cross build)
-#   cmake .. -DDEBUG_BUILD=ON       # -O0 -g, assertions enabled
-#   cmake .. -DCHESS960_DEBUG=ON    # Chess960 extra debug output
-#   cmake .. -DCMAKE_CXX_COMPILER=clang++
-#   cmake .. -DCMAKE_BUILD_TYPE=Release
-#
-# Out-of-source build (recommended):
-#   cmake -B build && cmake --build build
+# All-variants:
+#   cmake --build build --target all_variants
 # =============================================================================
 
-cmake_minimum_required(VERSION 3.16)
-project(Hugine VERSION 5.0 LANGUAGES CXX C)
-
-# --------------------------------------------------------------------------
-# Options  (tri-state: ON / OFF / AUTO where AUTO means detect at config time)
-# --------------------------------------------------------------------------
-option(SYZYGY        "Enable Syzygy tablebases via jdart1/Fathom (AUTO=detect)" AUTO)
-option(NNUE          "Enable NNUE neural-network eval (AUTO=detect .nnue file)" AUTO)
-option(NATIVE        "Use -march=native for maximum host performance"           ON)
-option(DEBUG_BUILD   "Debug build: -O0 -g, assertions enabled"                  OFF)
-option(CHESS960_DEBUG "Enable Chess960 extra debug output"                      OFF)
-
-# Tri-state helper — cmake options are bool, so we use a string cache entry
-# for SYZYGY and NNUE so users can set them to "AUTO".
-set(SYZYGY "AUTO" CACHE STRING "Syzygy support: AUTO | ON | OFF")
-set(NNUE   "AUTO" CACHE STRING "NNUE support:   AUTO | ON | OFF")
-set_property(CACHE SYZYGY PROPERTY STRINGS AUTO ON OFF)
-set_property(CACHE NNUE   PROPERTY STRINGS AUTO ON OFF)
-
-# --------------------------------------------------------------------------
-# Require C++17
-# --------------------------------------------------------------------------
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
 
-# --------------------------------------------------------------------------
-# Source
-# --------------------------------------------------------------------------
-set(ENGINE_SRC "${CMAKE_SOURCE_DIR}/hugine.cpp")
-if(NOT EXISTS "${ENGINE_SRC}")
-    message(FATAL_ERROR "Source file not found: ${ENGINE_SRC}\n"
-                        "Run cmake from the hugine directory.")
+# ── Source ────────────────────────────────────────────────────────────────────
+set(SRC "${CMAKE_SOURCE_DIR}/hugine-iota-v510.cpp")
+if(NOT EXISTS "${SRC}")
+    message(FATAL_ERROR "Source file not found: ${SRC}")
 endif()
 
-# --------------------------------------------------------------------------
-# Detect Android / Termux
-# --------------------------------------------------------------------------
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
-   (EXISTS "/data/data/com.termux" OR DEFINED ENV{PREFIX} AND
-    "$ENV{PREFIX}" MATCHES "termux"))
-    set(IS_ANDROID TRUE)
-    message(STATUS "[platform] Android/Termux detected")
+# ── Options ───────────────────────────────────────────────────────────────────
+option(NNUE       "Compile NNUE evaluator (Hugine-native + Stockfish .nnue)" ON)
+option(NNUE_LARGE "512-node Hugine-native architecture" OFF)
+option(NNUE_XL    "1024-node Hugine-native architecture"  OFF)
+option(SYZYGY     "Syzygy endgame tablebases (Fathom)" OFF)
+option(PEXT       "BMI2 PEXT bitboards" OFF)
+option(NATIVE     "Enable -march=native" ON)
+option(AVX2       "Force AVX2 SIMD" OFF)
+option(SSE4       "Force SSE4.1 SIMD" OFF)
+option(SANITIZE   "ASAN + UBSAN" OFF)
+
+# ── Main target ───────────────────────────────────────────────────────────────
+add_executable(hugine ${SRC})
+target_compile_options(hugine PRIVATE
+    -Wall -Wextra -Wno-unused-parameter)
+
+# ── Build type ────────────────────────────────────────────────────────────────
+if(SANITIZE)
+    target_compile_options(hugine PRIVATE -O0 -g -fsanitize=address,undefined)
+    target_link_options(hugine PRIVATE -fsanitize=address,undefined)
+    message(STATUS "[hugine] ASAN+UBSAN enabled")
+elseif(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    target_compile_options(hugine PRIVATE -O0 -g)
 else()
-    set(IS_ANDROID FALSE)
+    target_compile_definitions(hugine PRIVATE NDEBUG)
+    target_compile_options(hugine PRIVATE -O3)
 endif()
 
-# --------------------------------------------------------------------------
-# Optimisation flags
-# --------------------------------------------------------------------------
-if(DEBUG_BUILD)
-    message(STATUS "[build]    Debug build (-O0 -g)")
-    set(OPT_FLAGS -O0 -g)
-    add_compile_definitions(DEBUG)
+# ── Architecture ─────────────────────────────────────────────────────────────
+if(NATIVE AND NOT CMAKE_CROSSCOMPILING)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
+        target_compile_options(hugine PRIVATE -march=native)
+    endif()
+endif()
+if(AVX2)
+    target_compile_options(hugine PRIVATE -mavx2)
+    message(STATUS "[hugine] AVX2 forced")
+endif()
+if(SSE4)
+    target_compile_options(hugine PRIVATE -msse4.1)
+    message(STATUS "[hugine] SSE4.1 forced")
+endif()
+if(PEXT)
+    target_compile_options(hugine PRIVATE -mbmi2)
+    message(STATUS "[hugine] BMI2/PEXT enabled")
 else()
-    if(MSVC)
-        set(OPT_FLAGS /O2)
-    else()
-        set(OPT_FLAGS -O3)
-    endif()
-    add_compile_definitions(NDEBUG)
+    target_compile_definitions(hugine PRIVATE NO_PEXT)
 endif()
 
-# -march=native: skip on Android (can emit instructions the kernel rejects),
-# skip on MSVC (uses /arch: instead), honour NATIVE=OFF for cross builds.
-if(NATIVE AND NOT IS_ANDROID AND NOT MSVC)
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64")
-        list(APPEND OPT_FLAGS -march=native)
-        message(STATUS "[arch]     -march=native enabled (x86_64)")
-    else()
-        message(STATUS "[arch]     -march=native skipped (non-x86 host)")
-    endif()
-elseif(IS_ANDROID)
-    message(STATUS "[arch]     -march=native skipped (Android/Termux)")
-elseif(NOT NATIVE)
-    message(STATUS "[arch]     -march=native disabled by NATIVE=OFF")
-endif()
-
-# --------------------------------------------------------------------------
-# Threads
-# --------------------------------------------------------------------------
+# ── Threading ─────────────────────────────────────────────────────────────────
 find_package(Threads REQUIRED)
-
-# --------------------------------------------------------------------------
-# Detect / configure jdart1/Fathom (Syzygy)
-# --------------------------------------------------------------------------
-# Fathom layout expected at:
-#   ${CMAKE_SOURCE_DIR}/Fathom/src/tbprobe.h    <- header
-#   ${CMAKE_SOURCE_DIR}/Fathom/obj/tbprobe.o    <- pre-built object
-#   ${CMAKE_SOURCE_DIR}/Fathom/Makefile
-#
-# CMake does NOT recompile Fathom's C sources directly — it delegates to
-# Fathom's own Makefile via a custom command, exactly like builder.sh does.
-# This is the correct approach because jdart1/Fathom's Makefile sets up
-# obj/ and handles platform-specific C11 flags internally.
-# --------------------------------------------------------------------------
-set(FATHOM_DIR  "${CMAKE_SOURCE_DIR}/Fathom")
-set(FATHOM_HDR  "${FATHOM_DIR}/src/tbprobe.h")
-set(FATHOM_OBJ  "${FATHOM_DIR}/obj/tbprobe.o")
-set(FATHOM_MK   "${FATHOM_DIR}/Makefile")
-
-# Resolve SYZYGY setting
-if(SYZYGY STREQUAL "ON")
-    if(NOT EXISTS "${FATHOM_HDR}")
-        message(FATAL_ERROR
-            "[syzygy] SYZYGY=ON but ${FATHOM_HDR} not found.\n"
-            "Clone jdart1 Fathom first:\n"
-            "  git clone https://github.com/jdart1/Fathom Fathom\n"
-            "Then re-run cmake.")
-    endif()
-    set(USE_SYZYGY TRUE)
-    message(STATUS "[syzygy]   forced ON")
-elseif(SYZYGY STREQUAL "OFF")
-    set(USE_SYZYGY FALSE)
-    message(STATUS "[syzygy]   forced OFF")
-else()  # AUTO
-    if(EXISTS "${FATHOM_HDR}")
-        set(USE_SYZYGY TRUE)
-        message(STATUS "[syzygy]   auto-detected Fathom at ${FATHOM_HDR} -> ON")
-    else()
-        set(USE_SYZYGY FALSE)
-        message(STATUS "[syzygy]   Fathom not found -> OFF")
-        message(STATUS "           (to enable: git clone https://github.com/jdart1/Fathom Fathom)")
-    endif()
-endif()
-
-# --------------------------------------------------------------------------
-# Build Fathom via its Makefile as an external project command
-# --------------------------------------------------------------------------
-if(USE_SYZYGY)
-    if(NOT EXISTS "${FATHOM_MK}")
-        message(FATAL_ERROR
-            "[syzygy] Fathom/Makefile not found.\n"
-            "Clone with: git clone https://github.com/jdart1/Fathom Fathom")
-    endif()
-
-    # Extra CFLAGS for platforms that need _DEFAULT_SOURCE
-    set(FATHOM_EXTRA_CFLAGS "-O2")
-    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" OR IS_ANDROID)
-        string(APPEND FATHOM_EXTRA_CFLAGS " -D_DEFAULT_SOURCE")
-    endif()
-
-    # Invoke Fathom's own Makefile.  The stamp file lets cmake know whether
-    # the object is up-to-date without re-running make every build.
-    set(FATHOM_STAMP "${CMAKE_BINARY_DIR}/fathom_built.stamp")
-
-    add_custom_command(
-        OUTPUT  "${FATHOM_OBJ}" "${FATHOM_STAMP}"
-        COMMAND ${CMAKE_MAKE_PROGRAM}
-                -C "${FATHOM_DIR}"
-                CC="${CMAKE_C_COMPILER}"
-                CFLAGS="${FATHOM_EXTRA_CFLAGS}"
-        COMMAND ${CMAKE_COMMAND} -E touch "${FATHOM_STAMP}"
-        COMMENT "[fathom] Building jdart1/Fathom via its Makefile..."
-        VERBATIM
-    )
-
-    add_custom_target(fathom_build DEPENDS "${FATHOM_OBJ}" "${FATHOM_STAMP}")
-
-    # Validate that the object was actually produced
-    # (checked at link time — cmake will error if FATHOM_OBJ is missing)
-endif()
-
-# --------------------------------------------------------------------------
-# Detect NNUE network file
-# --------------------------------------------------------------------------
-if(NNUE STREQUAL "ON")
-    set(USE_NNUE TRUE)
-    message(STATUS "[nnue]     forced ON")
-elseif(NNUE STREQUAL "OFF")
-    set(USE_NNUE FALSE)
-    message(STATUS "[nnue]     forced OFF")
-else()  # AUTO
-    file(GLOB NNUE_FILES
-        "${CMAKE_SOURCE_DIR}/*.nnue"
-        "${CMAKE_SOURCE_DIR}/nn-*.bin")
-    if(NNUE_FILES)
-        list(GET NNUE_FILES 0 NNUE_FOUND)
-        set(USE_NNUE TRUE)
-        message(STATUS "[nnue]     auto-detected ${NNUE_FOUND} -> ON")
-    else()
-        set(USE_NNUE FALSE)
-        message(STATUS "[nnue]     no .nnue / nn-*.bin found -> classical eval")
-    endif()
-endif()
-
-# --------------------------------------------------------------------------
-# Chess960 extra debug
-# --------------------------------------------------------------------------
-if(CHESS960_DEBUG)
-    message(STATUS "[chess960] extra debug output ON")
-endif()
-
-# --------------------------------------------------------------------------
-# Define the executable
-# --------------------------------------------------------------------------
-add_executable(hugine "${ENGINE_SRC}")
-
-# Always place the compiled binary in <cmake_binary_dir>/build/
-# so both `cmake -B build` and in-source cmake produce the same layout.
-set_target_properties(hugine PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/build"
-)
-
-# --------------------------------------------------------------------------
-# Compile definitions
-# --------------------------------------------------------------------------
-if(USE_SYZYGY)
-    target_compile_definitions(hugine PRIVATE USE_SYZYGY)
-else()
-    target_compile_definitions(hugine PRIVATE NO_SYZYGY)
-endif()
-
-if(USE_NNUE)
-    target_compile_definitions(hugine PRIVATE USE_NNUE)
-endif()
-
-if(CHESS960_DEBUG)
-    target_compile_definitions(hugine PRIVATE CHESS960_EXTRA_DEBUG)
-endif()
-
-# --------------------------------------------------------------------------
-# Compile options
-# --------------------------------------------------------------------------
-if(MSVC)
-    target_compile_options(hugine PRIVATE
-        /std:c++17 /W3 /EHsc
-        $<IF:$<BOOL:${DEBUG_BUILD}>,/Od /Zi,/O2>
-    )
-else()
-    target_compile_options(hugine PRIVATE
-        -Wall -Wextra -Wno-unused-parameter
-        ${OPT_FLAGS}
-    )
-endif()
-
-# --------------------------------------------------------------------------
-# Include paths
-# --------------------------------------------------------------------------
-if(USE_SYZYGY)
-    # Bare  #include "tbprobe.h"  resolves via this include path.
-    target_include_directories(hugine PRIVATE "${FATHOM_DIR}/src")
-endif()
-
-# --------------------------------------------------------------------------
-# Link libraries
-# --------------------------------------------------------------------------
 target_link_libraries(hugine PRIVATE Threads::Threads)
 
-if(USE_SYZYGY)
-    # Link Fathom's pre-built object file directly
-    target_sources(hugine PRIVATE "${FATHOM_OBJ}")
-    add_dependencies(hugine fathom_build)
+# ── NNUE ─────────────────────────────────────────────────────────────────────
+# -DUSE_NNUE compiles in both the SFNNUEEvaluator (Stockfish .nnue native)
+# and NNUEEvaluator (Hugine-native .nnue).  At runtime the loader auto-selects
+# based on the file header.
+if(NNUE)
+    target_compile_definitions(hugine PRIVATE USE_NNUE)
+    message(STATUS "[hugine] NNUE: ON — Hugine-native + Stockfish SF10-SF16+ .nnue")
+    message(STATUS "         Runtime: setoption name EvalFile value <path>.nnue")
+    if(NNUE_XL)
+        target_compile_definitions(hugine PRIVATE NNUE_XL NNUE_LARGE)
+        message(STATUS "[hugine] NNUE_XL: 1024-node Hugine architecture")
+    elseif(NNUE_LARGE)
+        target_compile_definitions(hugine PRIVATE NNUE_LARGE)
+        message(STATUS "[hugine] NNUE_LARGE: 512-node Hugine architecture")
+    endif()
+else()
+    message(STATUS "[hugine] NNUE: OFF (classical eval)")
 endif()
 
-# MSVC: no extra thread lib needed (uses native Win32 threads)
-if(NOT MSVC AND NOT APPLE)
-    target_link_libraries(hugine PRIVATE pthread)
+# ── Syzygy / Fathom ───────────────────────────────────────────────────────────
+if(SYZYGY)
+    set(FATHOM_DIR "${CMAKE_SOURCE_DIR}/Fathom")
+    if(NOT EXISTS "${FATHOM_DIR}/src/tbprobe.h")
+        message(FATAL_ERROR
+            "SYZYGY=ON but Fathom not found at ${FATHOM_DIR}.\n"
+            "  git clone https://github.com/jdart1/Fathom Fathom")
+    endif()
+    add_library(fathom STATIC "${FATHOM_DIR}/src/tbprobe.c")
+    target_compile_options(fathom PRIVATE -O2)
+    target_compile_definitions(fathom PRIVATE _DEFAULT_SOURCE)
+    target_include_directories(fathom PUBLIC "${FATHOM_DIR}/src")
+    target_compile_definitions(hugine PRIVATE USE_SYZYGY)
+    target_include_directories(hugine PRIVATE "${FATHOM_DIR}/src")
+    target_link_libraries(hugine PRIVATE fathom)
+    message(STATUS "[hugine] Syzygy: Fathom at ${FATHOM_DIR}")
+else()
+    target_compile_definitions(hugine PRIVATE NO_SYZYGY)
+    message(STATUS "[hugine] Syzygy: OFF")
 endif()
 
-# --------------------------------------------------------------------------
-# Print final summary
-# --------------------------------------------------------------------------
-message(STATUS "")
-message(STATUS "=== Hugine 5.0 Iota — Build Configuration ===")
-message(STATUS "  Source   : ${ENGINE_SRC}")
-message(STATUS "  Compiler : ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
-message(STATUS "  Platform : ${CMAKE_SYSTEM_NAME} ${CMAKE_SYSTEM_PROCESSOR}")
-message(STATUS "  Syzygy   : ${USE_SYZYGY}")
-message(STATUS "  NNUE     : ${USE_NNUE}")
-message(STATUS "  Debug    : ${DEBUG_BUILD}")
-message(STATUS "  Native   : ${NATIVE}")
-message(STATUS "  Chess960 : ${CHESS960_DEBUG}")
-message(STATUS "  Output   : build/hugine")
-message(STATUS "")
-message(STATUS "  Build with:  cmake --build .")
-message(STATUS "")
-
-# --------------------------------------------------------------------------
-# Install target (optional — copies binary to CMAKE_INSTALL_PREFIX/bin)
-# --------------------------------------------------------------------------
+# ── Install ───────────────────────────────────────────────────────────────────
 include(GNUInstallDirs)
 install(TARGETS hugine RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+# ── All-variants target (convenience) ────────────────────────────────────────
+add_custom_target(all_variants
+    COMMAND ${CMAKE_COMMAND} -E echo "Building all 11 Hugine variants …"
+    COMMAND ${CMAKE_CXX_COMPILER} -O2  -std=c++17 -pthread -DNO_SYZYGY -DNO_PEXT -Wall -Wextra -Wno-unused-parameter ${SRC} -o ${CMAKE_BINARY_DIR}/hugine_base          -lpthread
+    COMMAND ${CMAKE_CXX_COMPILER} -O3 -march=native -std=c++17 -pthread -DNO_SYZYGY -DNO_PEXT -DNDEBUG -Wall -Wextra -Wno-unused-parameter ${SRC} -o ${CMAKE_BINARY_DIR}/hugine_fast          -lpthread
+    COMMAND ${CMAKE_CXX_COMPILER} -O3 -march=native -mbmi2 -std=c++17 -pthread -DNO_SYZYGY -DNDEBUG -Wall -Wextra -Wno-unused-parameter ${SRC} -o ${CMAKE_BINARY_DIR}/hugine_pext          -lpthread
+    COMMAND ${CMAKE_CXX_COMPILER} -O3 -mavx2 -std=c++17 -pthread -DNO_SYZYGY -DNO_PEXT -DNDEBUG -Wall -Wextra -Wno-unused-parameter ${SRC} -o ${CMAKE_BINARY_DIR}/hugine_avx2          -lpthread
+    COMMAND ${CMAKE_CXX_COMPILER} -O3 -msse4.1 -std=c++17 -pthread -DNO_SYZYGY -DNO_PEXT -DNDEBUG -Wall -Wextra -Wno-unused-parameter ${SRC} -o ${CMAKE_BINARY_DIR}/hugine_sse4          -lpthread
+    COMMAND ${CMAKE_CXX_COMPILER} -O2  -std=c++17 -pthread -DNO_SYZYGY -DNO_PEXT -DUSE_NNUE -Wall -Wextra -Wno-unused-parameter ${SRC} -o ${CMAKE_BINARY_DIR}/hugine_nnue          -lpthread
+    COMMAND ${CMAKE_CXX_COMPILER} -O3 -march=native -mbmi2 -std=c++17 -pthread -DNO_SYZYGY -DUSE_NNUE -DNDEBUG -Wall -Wextra -Wno-unused-parameter ${SRC} -o ${CMAKE_BINARY_DIR}/hugine_fast_nnue     -lpthread
+    COMMAND ${CMAKE_CXX_COMPILER} -O3 -march=native -mavx2 -mbmi2 -std=c++17 -pthread -DNO_SYZYGY -DUSE_NNUE -DNDEBUG -Wall -Wextra -Wno-unused-parameter ${SRC} -o ${CMAKE_BINARY_DIR}/hugine_fast_nnue_avx2 -lpthread
+    COMMAND ${CMAKE_CXX_COMPILER} -O2  -std=c++17 -pthread -DNO_SYZYGY -DNO_PEXT -DNNUE_LARGE -Wall -Wextra -Wno-unused-parameter ${SRC} -o ${CMAKE_BINARY_DIR}/hugine_large         -lpthread
+    COMMAND ${CMAKE_CXX_COMPILER} -O2  -std=c++17 -pthread -DNO_SYZYGY -DNO_PEXT -DUSE_NNUE -DNNUE_LARGE -Wall -Wextra -Wno-unused-parameter ${SRC} -o ${CMAKE_BINARY_DIR}/hugine_large_nnue  -lpthread
+    COMMAND ${CMAKE_CXX_COMPILER} -O2  -std=c++17 -pthread -DNO_SYZYGY -DNO_PEXT -DNNUE_XL -Wall -Wextra -Wno-unused-parameter ${SRC} -o ${CMAKE_BINARY_DIR}/hugine_xl          -lpthread
+    COMMAND ${CMAKE_CXX_COMPILER} -O2  -std=c++17 -pthread -DNO_SYZYGY -DNO_PEXT -DUSE_NNUE -DNNUE_XL -Wall -Wextra -Wno-unused-parameter ${SRC} -o ${CMAKE_BINARY_DIR}/hugine_xl_nnue     -lpthread
+    COMMAND ${CMAKE_CXX_COMPILER} -O0  -g -fsanitize=address,undefined -std=c++17 -pthread -DNO_SYZYGY -DNO_PEXT -Wall -Wextra -Wno-unused-parameter ${SRC} -o ${CMAKE_BINARY_DIR}/hugine_asan -lpthread
+    COMMAND ${CMAKE_COMMAND} -E echo ""
+    COMMAND ${CMAKE_COMMAND} -E echo "All 11 variants built in ${CMAKE_BINARY_DIR}/"
+    COMMENT "Building all Hugine variants"
+)
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+message(STATUS "")
+message(STATUS "Hugine 5.1.0 Iota — configuration summary")
+message(STATUS "  Source:    ${SRC}")
+message(STATUS "  NNUE:      ${NNUE}")
+message(STATUS "  NNUE_LARGE:${NNUE_LARGE}")
+message(STATUS "  NNUE_XL:   ${NNUE_XL}")
+message(STATUS "  Syzygy:    ${SYZYGY}")
+message(STATUS "  PEXT:      ${PEXT}")
+message(STATUS "  Sanitize:  ${SANITIZE}")
+message(STATUS "")
+message(STATUS "  Build:    cmake --build <build_dir>")
+message(STATUS "  Variants: cmake --build <build_dir> --target all_variants")
+message(STATUS "")

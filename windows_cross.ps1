@@ -55,7 +55,7 @@ $ErrorActionPreference = "Stop"
 $ScriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Path
 $BuildDir    = Join-Path $ScriptDir "build"
 $ToolDir     = Join-Path $ScriptDir "toolchains"
-$SrcFile     = Join-Path $ScriptDir "hugine.cpp"
+$SrcFile     = Join-Path $ScriptDir "hugine-gama-v5.cpp"
 $FathomDir   = Join-Path $ScriptDir "Fathom"
 $FathomSrc   = Join-Path $FathomDir "src\tbprobe.c"
 $FathomInc   = Join-Path $FathomDir "src"
@@ -219,12 +219,13 @@ function Build-ArchVariants {
     $DbgO  = @("-O0","-g","-DDEBUG")
 
     $VariantMap = [ordered]@{
-        "base"     = @{ SF=$SfOff; FO=$null;     Opt=$Opt; Extra=@() }
-        "syzygy"   = @{ SF=$SfOn;  FO=$FobjRel;  Opt=$Opt; Extra=@() }
-        "nnue"     = @{ SF=$SfOff; FO=$null;     Opt=$Opt; Extra=@("-DUSE_NNUE") }
-        "full"     = @{ SF=$SfOn;  FO=$FobjFull; Opt=$Opt; Extra=@("-DUSE_NNUE") }
-        "chess960" = @{ SF=$SfOff; FO=$null;     Opt=$Opt; Extra=@("-DCHESS960_EXTRA_DEBUG") }
-        "debug"    = @{ SF=$SfOff; FO=$null;     Opt=$DbgO; Extra=@() }
+        "base"       = @{ SF=$SfOff; FO=$null;     Opt=$Opt;  Extra=@() }
+        "syzygy"     = @{ SF=$SfOn;  FO=$FobjRel;  Opt=$Opt;  Extra=@() }
+        "nnue"       = @{ SF=$SfOff; FO=$null;     Opt=$Opt;  Extra=@("-DUSE_NNUE") }
+        "nnue_large" = @{ SF=$SfOff; FO=$null;     Opt=$Opt;  Extra=@("-DUSE_NNUE", "-DNNUE_LARGE") }
+        "full"       = @{ SF=$SfOn;  FO=$FobjFull; Opt=$Opt;  Extra=@("-DUSE_NNUE") }
+        "chess960"   = @{ SF=$SfOff; FO=$null;     Opt=$Opt;  Extra=@("-DCHESS960_EXTRA_DEBUG") }
+        "debug"      = @{ SF=$SfOff; FO=$null;     Opt=$DbgO; Extra=@() }
     }
 
     foreach ($v in $ActiveVariants) {

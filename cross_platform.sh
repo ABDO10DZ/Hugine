@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Hugine 3.0 "Gama" — Cross-Platform Multi-Variant Build Script
+# Hugine 5.1.0 "Iota" — Cross-Platform Multi-Variant Build Script
 # =============================================================================
 # Produces up to 24 binaries (6 variants × 4 arches) in ./build/
 #
@@ -52,13 +52,19 @@ skip()  { echo -e "${DIM}[skip]  $*${RESET}"; }
 # --------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="$SCRIPT_DIR/build"
-SRC="$SCRIPT_DIR/hugine.cpp"
+SRC="$SCRIPT_DIR/hugine-iota-v510.cpp"
 FATHOM_DIR="$SCRIPT_DIR/Fathom"
 FATHOM_SRC="$FATHOM_DIR/src/tbprobe.c"
 FATHOM_INC="$FATHOM_DIR/src"
+# Hugine 5.1.0: NNUE is always compiled in (-DUSE_NNUE).
+# The engine accepts any Stockfish .nnue or Hugine-native .nnue at runtime
+# via: setoption name EvalFile value /path/to/file.nnue
+# No need for a dedicated ./nnue/ directory anymore.
 NNUE_DIR=""
 [[ -d "$SCRIPT_DIR/nnue" ]] && NNUE_DIR="$SCRIPT_DIR/nnue"
-NNUE_FILE=""  # individual file path for copying into proot; empty = no nnue
+# Also accept any .nnue in script dir directly
+NNUE_FILE=$(ls "$SCRIPT_DIR"/*.nnue "$SCRIPT_DIR"/nn-*.bin 2>/dev/null | head -1 || true)
+
 
 LLVM_VER="20260224"
 LLVM_X86_URL="https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_VER}/llvm-mingw-${LLVM_VER}-ucrt-ubuntu-22.04-x86_64.tar.xz"
@@ -97,7 +103,7 @@ compile() {
     local fobj="${5:-}" opt="${6:--O3 -DNDEBUG}" extra="${7:-}"
     local name; name="$(basename "$out")"
 
-    if echo "$extra" | grep -q "USE_NNUE" && [[ -z "${NNUE_DIR:-}" ]]; then
+    if false; then  # 5.1.0: always compile NNUE variants
         skip "$name  (no ./nnue/ directory)"; return
     fi
 
@@ -146,7 +152,9 @@ build_arch_variants() {
     else
         skip "hugine_${tag}_syzygy${ext}  (no Fathom)"
     fi
-    compile "$cxx" "$BUILD_DIR/hugine_${tag}_nnue${ext}"     "$cxxf" "$SFOFF" ""   "-O3 -DNDEBUG" "-DUSE_NNUE"
+    compile "$cxx" "$BUILD_DIR/hugine_${tag}_nnue${ext}"       "$cxxf" "$SFOFF" ""   "-O3 -DNDEBUG" "-DUSE_NNUE"
+    compile "$cxx" "$BUILD_DIR/hugine_${tag}_nnue_large${ext}" "$cxxf" "$SFOFF" ""   "-O3 -DNDEBUG" "-DUSE_NNUE -DNNUE_LARGE"
+    compile "$cxx" "$BUILD_DIR/hugine_${tag}_nnue_xl${ext}"    "$cxxf" "$SFOFF" ""   "-O2"          "-DUSE_NNUE -DNNUE_XL"
     if [[ -f "$FATHOM_SRC" ]]; then
         compile "$cxx" "$BUILD_DIR/hugine_${tag}_full${ext}"   "$cxxf" "$SFON"  "$ff" "-O3 -DNDEBUG" "-DUSE_NNUE"
     else
@@ -164,7 +172,7 @@ print_summary() {
     for arch in winx86 winARM linux86 linuxARM; do
         local ext=".exe"; [[ "$arch" == linux* ]] && ext=""
         echo -e "  ${BOLD}$arch${RESET}"
-        for v in base syzygy nnue full chess960 debug; do
+        for v in base syzygy nnue nnue_large full chess960 debug; do
             TOTAL=$((TOTAL+1))
             local f="$BUILD_DIR/hugine_${arch}_${v}${ext}"
             if [[ -f "$f" ]]; then
@@ -189,9 +197,16 @@ IS_TERMUX=0
 
 info "Host arch : $HOST_ARCH  |  Termux: $IS_TERMUX"
 [[ -f "$SRC" ]] || die "Source not found: $SRC"
-[[ -n "$NNUE_DIR" ]] \
-    && ok "NNUE dir : $NNUE_DIR" \
-    || warn "No ./nnue/ directory found — nnue/full variants will be skipped"
+# Hugine 5.1.0: NNUE variants always compile — net file loaded at runtime via UCI EvalFile.
+# Supported: Hugine-native .nnue, Stockfish HalfKP-256/HalfKA-256/HalfKAv2-512/1024/1536,
+#            COMPRESSED_LEB128 (SF16+ pytorch trainer output).
+if [[ -n "$NNUE_FILE" ]]; then
+    ok "NNUE net : $NNUE_FILE  (will be noted in README)"
+elif [[ -n "$NNUE_DIR" ]]; then
+    ok "NNUE dir : $NNUE_DIR"
+else
+    ok "NNUE     : evaluator compiled in — supply net at runtime via EvalFile"
+fi
 [[ -f "$FATHOM_SRC" ]] \
     && ok "Fathom   : $FATHOM_SRC" \
     || warn "Fathom not found — syzygy/full variants will be skipped"
@@ -343,12 +358,13 @@ skip()  { echo -e "${DIM}[skip]  $*${RESET}"; }
 WORK="/root/hugine"
 BUILD="$WORK/build"
 TOOLS="/root/toolchains"
-SRC="$WORK/hugine.cpp"
+SRC="$WORK/hugine-iota-v510.cpp"
 FATHOM_SRC="$WORK/Fathom/src/tbprobe.c"
 FATHOM_INC="$WORK/Fathom/src"
 NNUE_DIR=""
 [[ -d "$WORK/nnue" ]] && NNUE_DIR="$WORK/nnue"
-NNUE_FILE=""  # not used directly — engine uses NNUEPath at runtime
+NNUE_FILE=$(ls "$WORK"/*.nnue "$WORK"/nn-*.bin 2>/dev/null | head -1 || true)
+# 5.1.0: NNUE evaluator compiles without a bundled net; .nnue loaded at runtime
 
 mkdir -p "$BUILD" "$TOOLS"
 
@@ -412,7 +428,7 @@ compile() {
     local fobj="${5:-}" opt="${6:--O3 -DNDEBUG}" extra="${7:-}"
     local name; name="$(basename "$out")"
 
-    if echo "$extra" | grep -q "USE_NNUE" && [[ -z "${NNUE_DIR:-}" ]]; then
+    if false; then  # 5.1.0: always compile NNUE variants
         skip "$name  (no ./nnue/ directory)"; return
     fi
 

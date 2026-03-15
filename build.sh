@@ -1,33 +1,41 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Hugine 5.0 "Iota" — Universal Build Script
+# Hugine 5.1.0 "Iota" — Universal Build Script
 # =============================================================================
 # Works on: Linux, macOS, Android/Termux, Windows (Git Bash / WSL / MSYS2)
-# Fathom:   https://github.com/jdart1/Fathom  (NOT the deprecated SF fork)
+#
+# NNUE support (new in 5.1.0):
+#   Hugine now natively loads ANY Stockfish .nnue — no conversion tool needed.
+#   Supported SF formats: HalfKP-256 (SF10-12), HalfKA-256 (SF13-14),
+#   HalfKAv2-512/1024/1536 (SF15-16+), COMPRESSED_LEB128 (pytorch trainer).
+#   Hugine-native .nnue (from nnue_trainer/train.py) also loads as before.
 #
 # Usage:
-#   ./builder.sh                   auto-detect everything, best settings
-#   ./builder.sh --syzygy          force Syzygy on
-#   ./builder.sh --no-syzygy       force Syzygy off
-#   ./builder.sh --nnue            force NNUE on
-#   ./builder.sh --no-nnue         force NNUE off
-#   ./builder.sh --debug           debug build
-#   ./builder.sh --portable        no -march=native (cross-compile safe)
-#   ./builder.sh --compiler=clang++ use specific compiler
-#   ./builder.sh --exe=myengine    custom output binary name
-#   ./builder.sh --help            print this message
+#   ./build.sh                     auto-detect everything
+#   ./build.sh --syzygy            force Syzygy on
+#   ./build.sh --no-syzygy         force Syzygy off
+#   ./build.sh --nnue              force NNUE on
+#   ./build.sh --no-nnue           force NNUE off
+#   ./build.sh --nnue-large        Hugine 512-node architecture (larger net)
+#   ./build.sh --pext              enable BMI2/PEXT bitboards (x86_64 only)
+#   ./build.sh --avx2              force AVX2 SIMD path
+#   ./build.sh --sse4              force SSE4.1 SIMD path
+#   ./build.sh --pgo               2-pass profile-guided optimisation
+#   ./build.sh --debug             ASAN + UBSAN debug build
+#   ./build.sh --portable          no -march=native (cross-compile safe)
+#   ./build.sh --compiler=clang++  pick a specific compiler
+#   ./build.sh --exe=myengine      custom output name
+#   ./build.sh --help              print this message
 # =============================================================================
 
 set -euo pipefail
 
-# --------------------------------------------------------------------------
-# Colours (disabled on dumb terminals / Windows CMD)
-# --------------------------------------------------------------------------
+# ── Colours ──────────────────────────────────────────────────────────────────
 if [[ "${TERM:-}" != "dumb" ]] && [[ "${OS:-}" != "Windows_NT" ]]; then
-    RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-    CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
+    RED='\033[0;31m' GREEN='\033[0;32m' YELLOW='\033[1;33m'
+    CYAN='\033[0;36m' BOLD='\033[1m' RESET='\033[0m'
 else
-    RED=''; GREEN=''; YELLOW=''; CYAN=''; BOLD=''; RESET=''
+    RED='' GREEN='' YELLOW='' CYAN='' BOLD='' RESET=''
 fi
 
 info()  { echo -e "${CYAN}[info]${RESET}  $*"; }
@@ -36,277 +44,205 @@ warn()  { echo -e "${YELLOW}[warn]${RESET}  $*"; }
 error() { echo -e "${RED}[error]${RESET} $*" >&2; }
 die()   { error "$*"; exit 1; }
 
-# --------------------------------------------------------------------------
-# Defaults
-# --------------------------------------------------------------------------
-OPT_SYZYGY=""     # empty = auto-detect
-OPT_NNUE=""       # empty = auto-detect
-OPT_DEBUG=0
-OPT_PORTABLE=0
-OPT_COMPILER=""   # empty = auto-detect
-OPT_EXE=""        # empty = auto-detect from OS
-SRC="hugine.cpp"
+# ── Defaults ─────────────────────────────────────────────────────────────────
+OPT_SYZYGY="" OPT_NNUE="" OPT_NNUE_LARGE=0 OPT_NNUE_XL=0 OPT_PEXT=0
+OPT_AVX2=0 OPT_SSE4=0 OPT_PGO=0 OPT_DEBUG=0 OPT_PORTABLE=0
+OPT_COMPILER="" OPT_EXE=""
+SRC="hugine-iota-v510.cpp"
 
-# --------------------------------------------------------------------------
-# Parse arguments
-# --------------------------------------------------------------------------
+# ── Parse args ────────────────────────────────────────────────────────────────
 for arg in "$@"; do
     case "$arg" in
-        --syzygy)       OPT_SYZYGY=1 ;;
-        --no-syzygy)    OPT_SYZYGY=0 ;;
-        --nnue)         OPT_NNUE=1 ;;
-        --no-nnue)      OPT_NNUE=0 ;;
-        --debug)        OPT_DEBUG=1 ;;
-        --portable)     OPT_PORTABLE=1 ;;
-        --compiler=*)   OPT_COMPILER="${arg#--compiler=}" ;;
-        --exe=*)        OPT_EXE="${arg#--exe=}" ;;
-        --help|-h)
-            sed -n '3,20p' "$0" | sed 's/^# //'
-            exit 0 ;;
-        *) warn "Unknown argument: $arg  (use --help)" ;;
+        --syzygy)        OPT_SYZYGY=1 ;;
+        --no-syzygy)     OPT_SYZYGY=0 ;;
+        --nnue)          OPT_NNUE=1 ;;
+        --no-nnue)       OPT_NNUE=0 ;;
+        --nnue-large)    OPT_NNUE_LARGE=1 ;;
+        --nnue-xl)       OPT_NNUE_XL=1; OPT_NNUE_LARGE=1 ;;
+        --pext)          OPT_PEXT=1 ;;
+        --avx2)          OPT_AVX2=1 ;;
+        --sse4)          OPT_SSE4=1 ;;
+        --pgo)           OPT_PGO=1 ;;
+        --debug)         OPT_DEBUG=1 ;;
+        --portable)      OPT_PORTABLE=1 ;;
+        --compiler=*)    OPT_COMPILER="${arg#--compiler=}" ;;
+        --exe=*)         OPT_EXE="${arg#--exe=}" ;;
+        --help|-h)       sed -n '3,24p' "$0" | sed 's/^# //'; exit 0 ;;
+        *)               warn "Unknown: $arg  (use --help)" ;;
     esac
 done
 
-# --------------------------------------------------------------------------
-# Detect OS
-# --------------------------------------------------------------------------
-info "Detecting build environment ..."
-
+# ── Detect OS + Arch ─────────────────────────────────────────────────────────
+info "Detecting environment …"
 OS_NAME="unknown"
 case "$(uname -s 2>/dev/null || echo Windows)" in
-    Linux)
-        if [[ -d /data/data/com.termux ]] || [[ "${PREFIX:-}" == *termux* ]]; then
-            OS_NAME="android"
-        else
-            OS_NAME="linux"
-        fi ;;
-    Darwin)               OS_NAME="macos" ;;
-    MINGW*|MSYS*|CYGWIN*) OS_NAME="windows" ;;
-    Windows*)             OS_NAME="windows" ;;
-    *)                    OS_NAME="posix" ;;
+    Linux) [[ -d /data/data/com.termux ]] || [[ "${PREFIX:-}" == *termux* ]] \
+               && OS_NAME="android" || OS_NAME="linux" ;;
+    Darwin) OS_NAME="macos" ;;
+    MINGW*|MSYS*|CYGWIN*|Windows*) OS_NAME="windows" ;;
+    *) OS_NAME="posix" ;;
 esac
-
-# --------------------------------------------------------------------------
-# Detect Architecture
-# --------------------------------------------------------------------------
 ARCH="$(uname -m 2>/dev/null || echo unknown)"
 case "$ARCH" in
-    x86_64|amd64)       ARCH_TAG="x86_64" ;;
-    aarch64|arm64)      ARCH_TAG="arm64"  ;;
-    armv7*|armv8*|arm*) ARCH_TAG="arm32"  ;;
-    *)                  ARCH_TAG="unknown" ;;
+    x86_64|amd64)   ARCH_TAG="x86_64" ;;
+    aarch64|arm64)  ARCH_TAG="arm64" ;;
+    armv7*|arm*)    ARCH_TAG="arm32" ;;
+    *)              ARCH_TAG="unknown" ;;
 esac
-
 info "OS: ${BOLD}${OS_NAME}${RESET}  Arch: ${BOLD}${ARCH_TAG}${RESET}"
 
-# --------------------------------------------------------------------------
-# Detect compiler
-# --------------------------------------------------------------------------
+# ── Compiler ─────────────────────────────────────────────────────────────────
 if [[ -n "$OPT_COMPILER" ]]; then
     CXX="$OPT_COMPILER"
-    command -v "$CXX" >/dev/null 2>&1 || die "Compiler '$CXX' not found in PATH"
-    ok "Using compiler: $CXX (user-specified)"
+    command -v "$CXX" >/dev/null 2>&1 || die "Compiler '$CXX' not found"
+    ok "Compiler: $CXX (user)"
 else
-    CXX=""
-    for candidate in clang++ g++ c++; do
-        if command -v "$candidate" >/dev/null 2>&1; then
-            CXX="$candidate"
-            ok "Compiler auto-selected: $CXX"
-            break
-        fi
+    for c in clang++ g++ c++; do
+        command -v "$c" >/dev/null 2>&1 && CXX="$c" && ok "Compiler: $c" && break
     done
-    [[ -z "$CXX" ]] && die "No C++ compiler found. Install g++ or clang++."
+    [[ -z "${CXX:-}" ]] && die "No C++ compiler. Install g++ or clang++."
 fi
+CC="${CC:-cc}"; command -v "$CC" >/dev/null 2>&1 || CC="$CXX"
 
-# C compiler for Fathom (falls back to CXX if cc not available)
-CC="${CC:-cc}"
-command -v "$CC" >/dev/null 2>&1 || CC="$CXX"
-
-# --------------------------------------------------------------------------
-# Optimisation flags
-# --------------------------------------------------------------------------
+# ── Optimisation ─────────────────────────────────────────────────────────────
 if [[ "$OPT_DEBUG" -eq 1 ]]; then
-    OPT_FLAGS="-O0 -g -DDEBUG"
-    info "Debug build enabled"
+    OPT_FLAGS="-O0 -g -fsanitize=address,undefined -DDEBUG"
+    warn "Debug build (ASAN+UBSAN) — do not use for performance testing"
 else
     OPT_FLAGS="-O3 -DNDEBUG"
 fi
 
-# Architecture-specific flags
+# ── Arch flags ────────────────────────────────────────────────────────────────
 ARCH_FLAGS=""
 if [[ "$OPT_PORTABLE" -eq 0 ]]; then
     if [[ "$OS_NAME" == "android" ]]; then
-        # -march=native on Termux/ARM can emit instructions the Android kernel
-        # rejects at runtime; omit it and let the compiler pick a safe default.
-        warn "-march=native skipped on Android (safe default used)"
+        warn "-march=native skipped on Android"
     elif [[ "$ARCH_TAG" == "x86_64" ]]; then
         ARCH_FLAGS="-march=native"
     fi
 fi
+[[ "$OPT_AVX2" -eq 1 ]] && ARCH_FLAGS+=" -mavx2"
+[[ "$OPT_SSE4" -eq 1 ]] && ARCH_FLAGS+=" -msse4.1"
+[[ "$OPT_PEXT" -eq 1 ]] && ARCH_FLAGS+=" -mbmi2"
+PEXT_FLAGS=""; [[ "$OPT_PEXT" -eq 0 ]] && PEXT_FLAGS="-DNO_PEXT"
 
-# --------------------------------------------------------------------------
-# Detect jdart1/Fathom
-# --------------------------------------------------------------------------
-# Expected layout after:
-#   git clone https://github.com/jdart1/Fathom Fathom && make -C Fathom
-#
-#   Fathom/Makefile
-#   Fathom/src/tbprobe.h     <- header (static, ships with source)
-#   Fathom/src/tbprobe.c
-#   Fathom/src/tbconfig.h    <- also static, no need to verify separately
-#   Fathom/src/stdendian.h
-#   Fathom/obj/tbprobe.o     <- produced by make -C Fathom  (we link this)
-#   Fathom/libfathom.so      <- also produced (not used here)
-# --------------------------------------------------------------------------
-FATHOM_HDR="Fathom/src/tbprobe.h"
-FATHOM_OBJ="Fathom/obj/tbprobe.o"
-USE_SYZYGY=0
-
+# ── Syzygy ────────────────────────────────────────────────────────────────────
+FATHOM_HDR="Fathom/src/tbprobe.h"; FATHOM_SRC="Fathom/src/tbprobe.c"
+FATHOM_OBJ="Fathom/src/tbprobe.o"; USE_SYZYGY=0
 if [[ "$OPT_SYZYGY" == "1" ]]; then
-    [[ -f "$FATHOM_HDR" ]] || die \
-"--syzygy requested but $FATHOM_HDR not found.
-Clone jdart1 Fathom first:
-  git clone https://github.com/jdart1/Fathom Fathom
-Then re-run this script."
-    USE_SYZYGY=1
-    info "Syzygy: forced ON"
+    [[ -f "$FATHOM_HDR" ]] || die "--syzygy: Fathom not found. git clone https://github.com/jdart1/Fathom Fathom"
+    USE_SYZYGY=1; info "Syzygy: ON (forced)"
 elif [[ "$OPT_SYZYGY" == "0" ]]; then
-    USE_SYZYGY=0
-    info "Syzygy: forced OFF"
+    info "Syzygy: OFF (forced)"
+elif [[ -f "$FATHOM_HDR" ]]; then
+    USE_SYZYGY=1; ok "Syzygy: auto-detected"
 else
-    if [[ -f "$FATHOM_HDR" ]]; then
-        USE_SYZYGY=1
-        ok "Syzygy: auto-detected Fathom at $FATHOM_HDR -> enabling"
-    else
-        USE_SYZYGY=0
-        info "Syzygy: Fathom not found -> building without"
-        info "        (to enable: git clone https://github.com/jdart1/Fathom Fathom)"
-    fi
+    info "Syzygy: OFF (Fathom not found)"
 fi
 
-# --------------------------------------------------------------------------
-# Build Fathom via its own Makefile  ->  produces Fathom/obj/tbprobe.o
-# --------------------------------------------------------------------------
 if [[ "$USE_SYZYGY" -eq 1 ]]; then
-
-    [[ -f "Fathom/Makefile" ]] || die \
-"Fathom/Makefile not found.
-Clone with:  git clone https://github.com/jdart1/Fathom Fathom"
-
-    info "Building jdart1 Fathom via its own Makefile ..."
-
-    # Extra CFLAGS for glibc / musl targets that need _DEFAULT_SOURCE for mmap
-    FATHOM_CFLAGS="-O2"
-    if [[ "$OS_NAME" == "android" || "$OS_NAME" == "linux" ]]; then
-        FATHOM_CFLAGS="$FATHOM_CFLAGS -D_DEFAULT_SOURCE"
-    fi
-
-    # Fathom's Makefile creates Fathom/obj/ and compiles tbprobe.c into it.
-    # We only pass CC + CFLAGS; everything else is handled by its Makefile.
-    if ! make -C Fathom CC="$CC" CFLAGS="$FATHOM_CFLAGS" 2>&1; then
-        die "Fathom build failed. Run 'make -C Fathom' manually to see full errors."
-    fi
-
-    # Confirm the object file we are about to link
-    [[ -f "$FATHOM_OBJ" ]] || die \
-"Fathom built but $FATHOM_OBJ was not produced.
-Check 'ls Fathom/obj/' and compare with Fathom/Makefile output paths."
-
-    ok "Fathom ready: $FATHOM_OBJ"
-
-    # -IFathom/src resolves the bare  #include "tbprobe.h"  in the engine.
-    # No symlink needed — that approach caused the case-sensitive-path warning.
-    SYZYGY_FLAGS="-DUSE_SYZYGY -IFathom/src"
-    SYZYGY_OBJS="$FATHOM_OBJ"
-
+    info "Compiling Fathom …"
+    FEXTRA=""; [[ "$OS_NAME" == android || "$OS_NAME" == linux ]] && FEXTRA="-D_DEFAULT_SOURCE"
+    "$CC" -O2 -std=c11 $FEXTRA -c "$FATHOM_SRC" -o "$FATHOM_OBJ" \
+        || die "Fathom compile failed. See SYZYGY_ANDROID_BUILD.md"
+    ok "Fathom: $FATHOM_OBJ"
+    SYZYGY_FLAGS="-DUSE_SYZYGY"; SYZYGY_OBJS="$FATHOM_OBJ"
 else
-    SYZYGY_FLAGS="-DNO_SYZYGY"
-    SYZYGY_OBJS=""
+    SYZYGY_FLAGS="-DNO_SYZYGY"; SYZYGY_OBJS=""
 fi
 
-# --------------------------------------------------------------------------
-# Detect NNUE network file
-# --------------------------------------------------------------------------
-USE_NNUE=0
-NNUE_FLAGS=""
+# ── NNUE ─────────────────────────────────────────────────────────────────────
+# In Hugine 5.1.0 the evaluator supports both Hugine-native .nnue files and
+# any Stockfish .nnue directly — the loader auto-selects at runtime.
+# Build flag -DUSE_NNUE only compiles in the evaluator; the actual network file
+# is specified at runtime via UCI: setoption name EvalFile value <path>
+USE_NNUE=0; NNUE_FLAGS=""; NNUE_NET=""
 
 if [[ "$OPT_NNUE" == "1" ]]; then
-    USE_NNUE=1
-    info "NNUE: forced ON"
+    USE_NNUE=1; info "NNUE: ON (forced)"
 elif [[ "$OPT_NNUE" == "0" ]]; then
-    USE_NNUE=0
-    info "NNUE: forced OFF"
+    info "NNUE: OFF (forced)"
 else
-    NNUE_FOUND="$(ls *.nnue nn-*.bin 2>/dev/null | head -1 || true)"
-    if [[ -n "$NNUE_FOUND" ]]; then
-        USE_NNUE=1
-        ok "NNUE: auto-detected $NNUE_FOUND -> enabling"
+    NNUE_NET=$(ls *.nnue nn-*.bin 2>/dev/null | head -1 || true)
+    if [[ -n "$NNUE_NET" ]]; then
+        USE_NNUE=1; ok "NNUE: found ${NNUE_NET}"
+        # Identify the format
+        python3 -c "
+import struct, sys
+try:
+    with open('$NNUE_NET','rb') as f: d=f.read(96)
+    if len(d)<8: sys.exit()
+    ver,arch = struct.unpack_from('<II',d,0)
+    if (ver & 0xFF000000)==0x7A000000:
+        print('  → Stockfish .nnue (will load natively via SFNNUEEvaluator)')
+    else:
+        print('  → Hugine-native .nnue')
+except: pass
+" 2>/dev/null || true
     else
-        USE_NNUE=0
-        info "NNUE: no .nnue / nn-*.bin found -> classical eval"
+        info "NNUE: no .nnue file found → classical eval"
+        info "      Pass --nnue to compile the evaluator anyway (load net at runtime)"
     fi
 fi
 
-[[ "$USE_NNUE" -eq 1 ]] && NNUE_FLAGS="-DUSE_NNUE" || NNUE_FLAGS=""
+[[ "$USE_NNUE" -eq 1 ]] && NNUE_FLAGS="-DUSE_NNUE"
+[[ "$OPT_NNUE_XL"    -eq 1 ]] && { NNUE_FLAGS+=" -DNNUE_XL";    info "NNUE_XL: 1024-node Hugine architecture"; }
+[[ "$OPT_NNUE_LARGE" -eq 1 && "$OPT_NNUE_XL" -eq 0 ]] && { NNUE_FLAGS+=" -DNNUE_LARGE"; info "NNUE_LARGE: 512-node Hugine architecture"; }
 
-# --------------------------------------------------------------------------
-# Output binary name
-# --------------------------------------------------------------------------
-mkdir -p build
-if [[ -n "$OPT_EXE" ]]; then
-    EXE="$OPT_EXE"
-elif [[ "$OS_NAME" == "windows" ]]; then
-    EXE="build/hugine.exe"
-else
-    EXE="build/hugine"
-fi
+# ── Output name ───────────────────────────────────────────────────────────────
+[[ -n "$OPT_EXE" ]] && EXE="$OPT_EXE" \
+    || { [[ "$OS_NAME" == "windows" ]] && EXE="hugine.exe" || EXE="hugine"; }
 
-# --------------------------------------------------------------------------
-# Threading flags
-# --------------------------------------------------------------------------
+# ── Threading ─────────────────────────────────────────────────────────────────
 THREAD_FLAGS="-pthread"
-if [[ "$OS_NAME" == "macos" ]]; then
-    THREAD_LIBS=""        # macOS links pthread automatically
+[[ "$OS_NAME" == "macos" ]] && THREAD_LIBS="" || THREAD_LIBS="-lpthread"
+
+# ── Build ─────────────────────────────────────────────────────────────────────
+COMPILE_FLAGS="-std=c++17 $OPT_FLAGS $ARCH_FLAGS $THREAD_FLAGS
+               $SYZYGY_FLAGS $NNUE_FLAGS $PEXT_FLAGS
+               -Wall -Wextra -Wno-unused-parameter"
+
+echo ""
+info "Compiling ${SRC} → ${EXE} …"
+
+if [[ "$OPT_PGO" -eq 1 && "$OPT_DEBUG" -eq 0 ]]; then
+    PGO_DIR="/tmp/hugine_pgo_$$"
+    info "PGO pass 1/2: generating profile …"
+    # shellcheck disable=SC2086
+    $CXX $COMPILE_FLAGS -fprofile-generate="$PGO_DIR" \
+        "$SRC" $SYZYGY_OBJS -o "${EXE}_pgo_gen" ${THREAD_LIBS}
+    mkdir -p "$PGO_DIR"
+    printf "position startpos\ngo depth 12\nquit\n" | ./"${EXE}_pgo_gen" >/dev/null 2>&1 || true
+    printf "position fen r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -\nperft 4\nquit\n" \
+        | ./"${EXE}_pgo_gen" >/dev/null 2>&1 || true
+    info "PGO pass 2/2: optimising with profile …"
+    # shellcheck disable=SC2086
+    $CXX $COMPILE_FLAGS -fprofile-use="$PGO_DIR" -fprofile-correction \
+        "$SRC" $SYZYGY_OBJS -o "$EXE" ${THREAD_LIBS}
+    rm -rf "$PGO_DIR" "${EXE}_pgo_gen"
 else
-    THREAD_LIBS="-lpthread"
+    # shellcheck disable=SC2086
+    $CXX $COMPILE_FLAGS "$SRC" $SYZYGY_OBJS -o "$EXE" ${THREAD_LIBS} \
+        || die "Compilation failed."
 fi
 
-# --------------------------------------------------------------------------
-# Verify source file
-# --------------------------------------------------------------------------
-[[ -f "$SRC" ]] || die "Source file '$SRC' not found. Run builder.sh from the hugine directory."
-
-# --------------------------------------------------------------------------
-# Assemble and run the compile command
-# --------------------------------------------------------------------------
-CMD=("$CXX" -std=c++17)
-for f in $OPT_FLAGS $ARCH_FLAGS $THREAD_FLAGS $SYZYGY_FLAGS $NNUE_FLAGS; do
-    CMD+=("$f")
-done
-CMD+=("$SRC")
-[[ -n "$SYZYGY_OBJS" ]] && CMD+=("$SYZYGY_OBJS")
-CMD+=(-o "$EXE")
-[[ -n "$THREAD_LIBS" ]] && CMD+=("$THREAD_LIBS")
-
 echo ""
-info "Build command:"
-echo "  ${CMD[*]}"
+ok "Build complete!"
 echo ""
-
-"${CMD[@]}" || die "Compilation failed."
-
-# --------------------------------------------------------------------------
-# Done
-# --------------------------------------------------------------------------
+printf "  ${BOLD}%-10s${RESET} %s\n" "Binary:"   "$EXE"
+printf "  ${BOLD}%-10s${RESET} %s\n" "OS:"       "$OS_NAME ($ARCH_TAG)"
+printf "  ${BOLD}%-10s${RESET} %s\n" "Compiler:" "$CXX"
+printf "  ${BOLD}%-10s${RESET} %s\n" "Syzygy:"   "$([ $USE_SYZYGY -eq 1 ] && echo 'yes (Fathom)' || echo 'no')"
+printf "  ${BOLD}%-10s${RESET} %s\n" "NNUE:"     "$([ $USE_NNUE -eq 1 ] && echo 'yes  ← accepts Hugine-native + any Stockfish .nnue' || echo 'no')"
+printf "  ${BOLD}%-10s${RESET} %s\n" "PGO:"      "$([ $OPT_PGO -eq 1 ] && echo 'yes (2-pass)' || echo 'no')"
+printf "  ${BOLD}%-10s${RESET} %s\n" "Debug:"    "$([ $OPT_DEBUG -eq 1 ] && echo 'yes (ASAN+UBSAN)' || echo 'no')"
 echo ""
-ok "Build successful!"
-echo ""
-echo -e "  ${BOLD}Binary  :${RESET} $EXE"
-echo -e "  ${BOLD}OS      :${RESET} $OS_NAME"
-echo -e "  ${BOLD}Arch    :${RESET} $ARCH_TAG"
-echo -e "  ${BOLD}Compiler:${RESET} $CXX"
-echo -e "  ${BOLD}Syzygy  :${RESET} $([[ $USE_SYZYGY -eq 1 ]] && echo 'yes (jdart1/Fathom)' || echo 'no')"
-echo -e "  ${BOLD}NNUE    :${RESET} $([[ $USE_NNUE   -eq 1 ]] && echo 'yes' || echo 'no (classical eval)')"
-echo -e "  ${BOLD}Debug   :${RESET} $([[ $OPT_DEBUG  -eq 1 ]] && echo 'yes' || echo 'no')"
-echo ""
-echo -e "  Run:  ./$EXE"
+echo -e "  Run:   ./$EXE"
+if [[ "$USE_NNUE" -eq 1 ]]; then
+    echo ""
+    echo -e "  ${CYAN}NNUE usage (any Stockfish .nnue or Hugine-native .nnue):${RESET}"
+    echo    "    setoption name EvalFile value /path/to/nn-XXXX.nnue"
+    echo    "  Supported: HalfKP-256, HalfKA-256, HalfKAv2-512/1024/1536
+             (Hugine-native: 256/512/1024-node --nnue/--nnue-large/--nnue-xl),"
+    echo    "             COMPRESSED_LEB128 (SF16+ pytorch trainer output)"
+fi

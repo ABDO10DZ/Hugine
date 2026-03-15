@@ -1,0 +1,159 @@
+Hugine Chess Engine — CHANGELOG
+================================
+
+────────────────────────────────────────────────────────────────────────────────
+v5.1.0  "Iota"  (current)
+────────────────────────────────────────────────────────────────────────────────
+
+NNUE_XL — 1024-Node Architecture  (added this cycle)
+Bugfix — bare `go` prints no bestmove on ARM/Android
+  • Root cause: `go` with no parameters correctly set `infinite=true`, but `depth`
+    remained at its default of 10.  The search thread ran to depth 10 and exited
+    naturally.  Since `infinite=true`, the main thread never joined → bestmove was
+    never printed.  The GUI hung waiting forever.
+  • Fix: `if (infinite) depth = MAX_PLY;`  — the depth loop now runs until
+    `stop_search` is set by stop(), making bare `go` behave like `go infinite`.
+  • Also fixed: `position fen … R3K22R …` typo in test suite (double 2 made the
+    rank invalid, causing engine to fall back to last position, inflating test time).
+
+Speed Optimizations
+  • LMR divisor 2.0 → 1.75:  more aggressive late-move reductions; ~5–10% node
+    reduction at typical tournament depths (12+).  Base offset 0.5 → 0.25 to avoid
+    over-reducing early moves.
+  • Futility pruning extended depth 3 → 4: one extra ply of per-move futility
+    pruning using the existing proven formula (SEE_QUIET_MARGIN + depth*50).
+  • Aspiration window: Fibonacci widening replaces doubling.  On a fail-low/high
+    the next window is (prev + current) instead of (2 × current), converging faster
+    on the first two retries and matching doubling for the third.
+  • History buckets 2 → 4 tiers in reduction():
+      > 600k (killer/TT): reduce 2 less   (was: 1 less above 400k)
+      > 400k (strong history): reduce 1 less
+      < 0    (bad history): reduce 1 more  (was: below 50k threshold)
+  • Null-move R: `2 + depth/4 + min(3, (eval-beta)/200)` (was `2 + depth/6`).
+    More aggressive at high depth and when static eval greatly exceeds beta.
+  • Node batch counter 256 → 1024: reduces atomic `global_nodes` update frequency
+    by 4×.  Material benefit on Android/ARM where atomic writes are more expensive.
+
+
+  • Third Hugine-native NNUE tier: FT=1024, L1=128, L2=32, out=1 (version=4).
+  • Build variants: hugine_xl (-DNNUE_XL) and hugine_xl_nnue (-DUSE_NNUE -DNNUE_XL).
+  • Full SIMD pipeline: AVX2/SSE4.1/NEON paths all handle FT_SIZE=1024 correctly.
+  • nnue_trainer/train.py: random/train commands accept --xl flag.
+  • Validation/inspect: version=4 accepted; "XL 1024" arch label.
+  • File size: ~40 MB (random weights); trained XL nets will be ~160 MB.
+  • Rejection: xl_nnue build rejects 256/512-node files gracefully (classical fallback).
+
+Syzygy Setup Utility — gen_syzygy.py  (new tool)
+  • Subcommands: info / list / download / verify / config / build
+  • Lists all official Syzygy piece-sets (3–6 man WDL + DTZ).
+  • Downloads .rtbw/.rtbz from tablebase.lichess.ovh with optional tqdm progress bars.
+  • Verifies magic bytes of downloaded files (WDL: 0x5D23E871/72, DTZ: 0xA9B78C59/5A).
+  • Prints exact setoption commands for the local tablebase directory.
+  • Prints Fathom build instructions tailored to the host OS (including Android/Termux).
+
+Build System
+  • build.sh, builder.sh, Makefile, CMakeLists.txt, cross_platform.sh:
+    all updated for hugine_xl and hugine_xl_nnue variants.
+  • Total standard variants: 13 (was 11).
+  • make all_variants now builds all 13 in one command.
+
+Test Suite — 211/211 (was 184/184)
+  • Layer 10 expanded: 7 → 14 tests (256 + 512 + 1024 architecture coverage).
+  • Layer 13 expanded: 35 → 45 tests (9 variants × 5 tests, added xl and xl_nnue).
+  • Layer 17 (SF NNUE): 10 new tests with graceful skip if no sf_nnue/ dir present.
+
+Bug Fixes
+  • Fixed critical bug: go infinite blocked the UCI run() loop, making "stop"
+    unreachable. go infinite / go ponder now return immediately so commands
+    like "stop" are processed in real time.
+  • Fixed Polyglot .bin book byte-order: engine now byte-swaps big-endian
+    Polyglot entries on load, enabling compatibility with any standard .bin
+    opening book (Arena, Scid, Cutechess, etc.).
+  • Fixed pinned_pieces(): removed dead variables 'between' and 'ray' that
+    were computed but never used, simplifying the pin-detection logic.
+  • Fixed test suite: all 184/184 tests now pass (was 178/184).
+
+Zero-Warning Build
+  • [[maybe_unused]] added to deprecated-but-retained tuning constants
+    (IID_REDUCTION, SINGULAR_MARGIN, LMP_BASE, LMP_FACTOR).
+  • Removed dead perft_divide() function (never called via UCI).
+  • All 11 build variants compile with -Wall -Wextra -Wno-unused-parameter
+    and zero warnings (GCC and Clang/NDK).
+
+Performance — Bulk Counting Perft  (added this cycle)
+  • Static perft_inner() replaces std::function lambda (~4× virtual overhead).
+  • Position::bulk_count_legal(): skips make/undo at depth 1 for non-complex
+    moves; falls back to full make/undo for check evasions, castling, e.p.,
+    and pinned pieces.
+  • Perft NPS: ~12M/s → ~65M/s startpos d5 (hugine_fast, ARM64).
+
+Performance — Full SIMD NNUE Vectorization  (added this cycle)
+  • add_piece() incremental accumulator update: AVX2 (16 int16/cycle),
+    SSE4.1 (8/cycle), ARM NEON (8/cycle), scalar fallback.
+  • recompute_accumulator() full FT rebuild vectorized with bias init.
+  • evaluate() forward pass: L0 ClippedReLU via _mm256_packs_epi16 with
+    lane-swap fix, L1 matmul via _mm256_madd_epi16, L2/output via SSE4.1
+    _mm_madd_epi16 and NEON vmulq_s16/vpadalq_s16.
+
+New Build Variants
+  • hugine_avx2        — -O3 -mavx2, no march=native, portable to Haswell+
+  • hugine_fast_nnue_avx2 — -O3 -march=native -mavx2 -DUSE_NNUE
+
+Infrastructure
+  • test_engine.py: all hardcoded /home/claude paths replaced with
+    SCRIPT_DIR-relative paths — test suite runs from any directory.
+  • book_builder.py: confirmed writes standard big-endian Polyglot .bin.
+  • NNUE trainer (train.py): expanded to full pipeline with random / generate
+    / train / validate subcommands; supports both standard (256) and large
+    (512) architectures; pure-Python fallback for generate/validate when
+    torch/numpy not installed.
+
+────────────────────────────────────────────────────────────────────────────────
+v5.0.1  "Iota"
+────────────────────────────────────────────────────────────────────────────────
+  • CORRHIST: pawn-hash + non-pawn-hash correction history (2 tables).
+  • 2-ply continuation history (follows_move tracking).
+  • LMP precomputed table replacing runtime formula.
+  • TT prefetch in qsearch move loop.
+  • Lazy SMP depth staggering for helper threads.
+  • TimeManager overhaul: soft/hard limits, game-phase scaling, node-count
+    check every 1024 nodes.
+  • PGO (Profile-Guided Optimisation) build infrastructure.
+
+────────────────────────────────────────────────────────────────────────────────
+v5.0.0  "Iota"
+────────────────────────────────────────────────────────────────────────────────
+  • Stockfish-style singular extension (double/triple/negative SE).
+  • Asymmetric aspiration windows.
+  • IIR (Internal Iterative Reduction) tuning.
+  • LMR tuning: Stockfish log×log pre-computed table.
+  • Speed batch (~10 optimisations): triangular PV table, flat stack-
+    allocated move arrays, selection sort, bitboard gives_check(),
+    relaxed-atomic node counting.
+  • Syzygy WDL mid-search probing.
+  • Contempt option.
+
+────────────────────────────────────────────────────────────────────────────────
+v4.0.0  "Gama" → v5  Migration
+────────────────────────────────────────────────────────────────────────────────
+  • Fathom jdart1 API integration (Syzygy tablebases, full WDL+DTZ).
+  • Magic bitboard O(1) lookup tables (Fancy Magic + PEXT path).
+  • Polyglot dual-mode hash (own/standard; auto-detects polyglot_random.h).
+  • NNUE v2: multi-file/directory load, EvalFile/NNUEPath unified,
+    512-node NNUE_LARGE build.
+  • Cross-platform build matrix: builder.sh, Makefile, CMakeLists.txt,
+    cross_platform.sh, windows_cross.ps1.
+  • Zero-warning baseline under -Wall -Wextra.
+
+────────────────────────────────────────────────────────────────────────────────
+v3.0.0  "Gama"  (first public)
+────────────────────────────────────────────────────────────────────────────────
+  • HalfKP NNUE evaluator (256→32→32→1).
+  • Lock-free transposition table (XOR trick, age-gating).
+  • Late Move Reductions (LMR), Late Move Pruning (LMP).
+  • Null Move Pruning, Futility Pruning, SEE bad-capture pruning.
+  • MVV-LVA move ordering, killer heuristic, history heuristic.
+  • Opening book (Polyglot .bin format).
+  • MultiPV, UCI Skill Level, UCI_LimitStrength.
+  • Lazy SMP multi-threading.
+  • UCI-compliant: Hash, Threads, MoveOverhead, Contempt, ShowWDL.
